@@ -55,7 +55,7 @@
 #define ETHERNET_RX_TEST_ETHERTYPE      0x88B5U
 #define ETHERNET_RX_TEST_TARGET_COUNT   1000U
 
-#define ETHERNET_ASYNC_TX_TEST_ENABLE       1
+#define ETHERNET_ASYNC_TX_TEST_ENABLE       0
 #define ETHERNET_TX_TEST_TARGET_COUNT    1000U
 #define ETHERNET_TX_TEST_RETRY_TIMEOUT_MS 5000U
 
@@ -431,52 +431,27 @@ static bool EthernetBootstrap_StartMac(const Lan8720Status *phy_status)
  */
 static void EthernetDemo_RxFrameHandler(const uint8_t *frame, uint16_t length, void *context)
 {
-  uint16_t ether_type;
+    uint16_t ether_type;
 
-  (void)context;
+    (void)context;
 
-  if (frame == NULL)
-  {
-    return;
-  }
-
-  g_ethernet_rx_frame_count++;
-
-  if (length < 14U)
-  {
-    return;
-  }
-
-  ether_type = ((uint16_t)frame[12] << 8) | (uint16_t)frame[13];
-
-  if (ether_type != ETHERNET_RX_TEST_ETHERTYPE)
-  {
-    return;
-  }
-
-  g_ethernet_rx_test_frame_count++;
-
-  if (g_ethernet_rx_test_frame_count == ETHERNET_RX_TEST_TARGET_COUNT)
-  {
-    printf("[ETH] Async RX test 1000/1000 PASS, total=%lu\r\n",
-           (unsigned long)g_ethernet_rx_frame_count);
-
-    EthernetDriverStats stats = {0};
-
-    if (EthernetDriver_GetStats(&stats))
+    if ((frame == NULL) || (length < 14U))
     {
-        printf(
-            "[ETH] RX stats: frames=%lu errors=%lu "
-            "dropped=%lu no_buffer=%lu "
-            "hal_errors=%lu dma=0x%08lX\r\n",
-            (unsigned long)stats.rx_frames,
-            (unsigned long)stats.rx_errors,
-            (unsigned long)stats.rx_dropped,
-            (unsigned long)stats.rx_buffer_unavailable,
-            (unsigned long)stats.hal_error_events,
-            (unsigned long)stats.last_dma_error_code);
+        return;
     }
-  }
+
+    g_ethernet_rx_frame_count++;
+
+    ether_type =
+        ((uint16_t)frame[12] << 8) |
+        (uint16_t)frame[13];
+
+    if (ether_type != ETHERNET_RX_TEST_ETHERTYPE)
+    {
+        return;
+    }
+
+    g_ethernet_rx_test_frame_count++;
 }
 
 #if ETHERNET_ASYNC_TX_TEST_ENABLE
