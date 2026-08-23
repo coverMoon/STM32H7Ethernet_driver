@@ -54,6 +54,10 @@
 
 #define ETHERNET_RX_TEST_ETHERTYPE      0x88B5U
 #define ETHERNET_RX_TEST_TARGET_COUNT   1000U
+
+#define ETHERNET_ASYNC_TX_TEST_ENABLE       1
+#define ETHERNET_TX_TEST_TARGET_COUNT    1000U
+#define ETHERNET_TX_TEST_RETRY_TIMEOUT_MS 5000U
 /* USER CODE END PD */
 
 /* Private macro -------------------------------------------------------------*/
@@ -73,10 +77,10 @@ const osThreadAttr_t BootstrapTask_attributes = {
   .stack_size = 128 * 4,
   .priority = (osPriority_t) osPriorityNormal,
 };
-/* Definitions for EthernetRxTask */
-osThreadId_t EthernetRxTaskHandle;
-const osThreadAttr_t EthernetRxTask_attributes = {
-  .name = "EthernetRxTask",
+/* Definitions for EthernetRuntime */
+osThreadId_t EthernetRuntimeHandle;
+const osThreadAttr_t EthernetRuntime_attributes = {
+  .name = "EthernetRuntime",
   .stack_size = 256 * 4,
   .priority = (osPriority_t) osPriorityAboveNormal,
 };
@@ -85,10 +89,14 @@ const osThreadAttr_t EthernetRxTask_attributes = {
 /* USER CODE BEGIN FunctionPrototypes */
 static bool EthernetBootstrap_StartMac(const Lan8720Status *phy_status);
 static void EthernetDemo_RxFrameHandler(const uint8_t *frame, uint16_t length, void *context);
+
+#if ETHERNET_ASYNC_TX_TEST_ENABLE
+static bool EthernetDemo_RunAsyncTxTest(void);
+#endif
 /* USER CODE END FunctionPrototypes */
 
 void StartBootstrapTask(void *argument);
-void EthernetRtos_RxTask(void *argument);
+void EthernetRtos_RuntimeTask(void *argument);
 
 void MX_FREERTOS_Init(void); /* (MISRA C 2004 rule 8.1) */
 
@@ -122,8 +130,8 @@ void MX_FREERTOS_Init(void) {
   /* creation of BootstrapTask */
   BootstrapTaskHandle = osThreadNew(StartBootstrapTask, NULL, &BootstrapTask_attributes);
 
-  /* creation of EthernetRxTask */
-  EthernetRxTaskHandle = osThreadNew(EthernetRtos_RxTask, NULL, &EthernetRxTask_attributes);
+  /* creation of EthernetRuntime */
+  EthernetRuntimeHandle = osThreadNew(EthernetRtos_RuntimeTask, NULL, &EthernetRuntime_attributes);
 
   /* USER CODE BEGIN RTOS_THREADS */
   /* add threads, ... */
@@ -235,6 +243,13 @@ void StartBootstrapTask(void *argument)
         if (EthernetBootstrap_StartMac(&phy_status))
         {
           printf("[ETH] MAC/DMA started\r\n");
+
+          #if ETHERNET_ASYNC_TX_TEST_ENABLE
+          if (EthernetDemo_RunAsyncTxTest())
+          {
+              printf("[ETH] Async TX queued 1000/1000\r\n");
+          }
+          #endif
         }
 
         last_phy_status = phy_status;
@@ -294,22 +309,22 @@ void StartBootstrapTask(void *argument)
   /* USER CODE END StartBootstrapTask */
 }
 
-/* USER CODE BEGIN Header_EthernetRtos_RxTask */
+/* USER CODE BEGIN Header_EthernetRtos_RuntimeTask */
 /**
-* @brief Function implementing the EthernetRxTask thread.
+* @brief Function implementing the EthernetRuntime thread.
 * @param argument: Not used
 * @retval None
 */
-/* USER CODE END Header_EthernetRtos_RxTask */
-__weak void EthernetRtos_RxTask(void *argument)
+/* USER CODE END Header_EthernetRtos_RuntimeTask */
+__weak void EthernetRtos_RuntimeTask(void *argument)
 {
-  /* USER CODE BEGIN EthernetRtos_RxTask */
+  /* USER CODE BEGIN EthernetRtos_RuntimeTask */
   /* Infinite loop */
   for(;;)
   {
     osDelay(1);
   }
-  /* USER CODE END EthernetRtos_RxTask */
+  /* USER CODE END EthernetRtos_RuntimeTask */
 }
 
 /* Private application code --------------------------------------------------*/
@@ -336,7 +351,7 @@ static bool EthernetBootstrap_StartMac(const Lan8720Status *phy_status)
 
   if (!EthernetRtos_IsReady())
   {
-    printf("[ETH] Ethernet RX runtime not ready\r\n");
+    printf("[ETH] Ethernet runtime not ready\r\n");
     return false;
   }
 
@@ -420,5 +435,81 @@ static void EthernetDemo_RxFrameHandler(const uint8_t *frame, uint16_t length, v
   }
 }
 
+#if ETHERNET_ASYNC_TX_TEST_ENABLE
+
+/**
+ * @brief  连续异步提交测试 Frame，验证 TX Buffer 回收和重试流程。
+ *
+ * @details
+ * Frame 尾部四字节写入发送序号；临时无可用资源时延时后重试，
+ * 直到达到目标数量或超过重试等待时间。
+ *
+ * @retval true   所有测试 Frame 均已成功提交。
+ * @retval false  Driver 返回错误或发送流程超时。
+ */
+static bool EthernetDemo_RunAsyncTxTest(void)
+{
+    static uint8_t test_frame[60] = {
+        0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF,
+        0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+        0x88, 0xB5,
+        'S', 'T', 'M', '3', '2', 'H', '7', ' ',
+        'a', 's', 'y', 'n', 'c', ' ', 'T', 'X'
+    };
+
+    uint32_t queued = 0U;
+    uint32_t retry_wait_ms = 0U;
+
+    while (queued < ETHERNET_TX_TEST_TARGET_COUNT)
+    {
+        EthernetTxResult result;
+
+        test_frame[56] = (uint8_t)(queued >> 24);
+        test_frame[57] = (uint8_t)(queued >> 16);
+        test_frame[58] = (uint8_t)(queued >> 8);
+        test_frame[59] = (uint8_t)queued;
+
+        result = EthernetDriver_TransmitAsync(
+            test_frame,
+            sizeof(test_frame));
+
+        if (result == ETHERNET_TX_QUEUED)
+        {
+            queued++;
+            retry_wait_ms = 0U;
+
+            if ((queued % 100U) == 0U)
+            {
+                printf(
+                    "[ETH] Async TX queued=%lu\r\n",
+                    (unsigned long)queued);
+            }
+
+            continue;
+        }
+
+        if (result == ETHERNET_TX_ERROR)
+        {
+            printf("[ETH] Async TX driver error\r\n");
+            return false;
+        }
+
+        if (retry_wait_ms >= ETHERNET_TX_TEST_RETRY_TIMEOUT_MS)
+        {
+            printf(
+                "[ETH] Async TX stalled at %lu\r\n",
+                (unsigned long)queued);
+
+            return false;
+        }
+
+        osDelay(1U);
+        retry_wait_ms++;
+    }
+
+    return true;
+}
+
+#endif
 /* USER CODE END Application */
 

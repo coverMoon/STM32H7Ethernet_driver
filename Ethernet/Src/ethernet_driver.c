@@ -38,11 +38,38 @@ static bool g_rx_buffer_in_use[ETH_RX_DESC_CNT];
 static bool g_tx_buffer_in_use[ETH_TX_DESC_CNT];
 
 static EthernetRxFrameStorage g_rx_frame;
+
 static EthernetDriverRxEventHandler g_rx_event_handler;
 static void *g_rx_event_context;
+static EthernetDriverTxEventHandler g_tx_event_handler;
+static void *g_tx_event_context;
 
 _Static_assert((ETHERNET_DMA_BUFFER_SIZE % ETHERNET_DMA_ALIGNMENT) == 0U,
                "Ethernet DMA buffer size must be cache-line aligned");
+
+/**
+ * @brief  进入 Ethernet Driver TX Buffer 状态管理临界区。
+ *
+ * @return 进入临界区前的 PRIMASK，用于恢复原中断状态。
+ */
+static uint32_t EthernetDriver_EnterCritical(void)
+{
+    uint32_t primask = __get_PRIMASK();
+
+    __disable_irq();
+
+    return primask;
+}
+
+/**
+ * @brief  离开 Ethernet Driver TX Buffer 状态管理临界区。
+ *
+ * @param[in] primask 进入临界区前保存的 PRIMASK。
+ */
+static void EthernetDriver_ExitCritical(uint32_t primask)
+{
+    __set_PRIMASK(primask);
+}
 
 /**
  * @brief  释放一个 RX DMA Buffer。
@@ -74,16 +101,22 @@ static bool EthernetDriver_ReleaseRxBuffer(uint8_t *buffer)
  */
 static uint8_t *EthernetDriver_AcquireTxBuffer(void)
 {
+    uint8_t *buffer = NULL;
+    uint32_t primask = EthernetDriver_EnterCritical();
+
     for (uint32_t i = 0U; i < ETH_TX_DESC_CNT; i++)
     {
         if (!g_tx_buffer_in_use[i])
         {
             g_tx_buffer_in_use[i] = true;
-            return g_tx_dma_buffers[i];
+            buffer = g_tx_dma_buffers[i];
+            break;
         }
     }
 
-    return NULL;
+    EthernetDriver_ExitCritical(primask);
+
+    return buffer;
 }
 
 /**
@@ -93,14 +126,18 @@ static uint8_t *EthernetDriver_AcquireTxBuffer(void)
  */
 static void EthernetDriver_ReleaseTxBuffer(uint8_t *buffer)
 {
+    uint32_t primask = EthernetDriver_EnterCritical();
+
     for (uint32_t i = 0U; i < ETH_TX_DESC_CNT; i++)
     {
         if (buffer == g_tx_dma_buffers[i])
         {
             g_tx_buffer_in_use[i] = false;
-            return;
+            break;
         }
     }
+
+    EthernetDriver_ExitCritical(primask);
 }
 
 /**
@@ -144,8 +181,12 @@ void EthernetDriver_Init(void)
 
     g_rx_frame.length = 0U;
     g_rx_frame.valid = false;
+
     g_rx_event_handler = NULL;
     g_rx_event_context = NULL;
+
+    g_tx_event_handler = NULL;
+    g_tx_event_context = NULL;
 }
 
 /**
@@ -166,6 +207,29 @@ void EthernetDriver_SetRxEventHandler(EthernetDriverRxEventHandler handler, void
 
     g_rx_event_context = context;
     g_rx_event_handler = handler;
+}
+
+/**
+ * @brief  注册 TX complete ISR 事件处理函数。
+ *
+ * @details
+ * 建议在 MAC/DMA 启动前完成注册。handler 在 ISR 上下文执行，
+ * 只能进行轻量事件转发或 RTOS FromISR-safe 通知。传入 NULL 可取消注册。
+ *
+ * @param[in] handler TX complete 事件处理函数。
+ * @param[in] context 调用处理函数时传入的用户上下文。
+ */
+void EthernetDriver_SetTxEventHandler(EthernetDriverTxEventHandler handler, void *context)
+{
+    if (handler == NULL)
+    {
+        g_tx_event_handler = NULL;
+        g_tx_event_context = NULL;
+        return;
+    }
+
+    g_tx_event_context = context;
+    g_tx_event_handler = handler;
 }
 
 /**
@@ -242,28 +306,29 @@ bool EthernetDriver_Start(void)
 }
 
 /**
- * @brief  以 polling 模式发送一个完整 Ethernet Frame。
+ * @brief  异步提交一个完整 Ethernet Frame。
  *
  * @details
- * Frame 首先复制到静态 TX DMA Buffer，再交给 HAL_ETH_Transmit()。
- * HAL 返回 HAL_OK 后归还 TX DMA Buffer；错误路径保留当前 Buffer ownership，
- * 等待后续错误恢复机制处理，避免在 DMA 状态不确定时提前复用 Buffer。
+ * Frame 会先复制到 Driver 管理的 TX DMA Buffer，再提交给 HAL 中断发送接口。
+ * 函数返回后，调用者即可释放或复用原始 frame。已提交 Buffer 在 TX complete
+ * 事件到达后由 EthernetDriver_ProcessTxCompletions() 回收。
  *
- * @param[in] frame       Ethernet Frame，包含目的 MAC、源 MAC、EtherType 和 Payload，
- *                        不包含 FCS。
- * @param[in] length      Frame 长度。
- * @param[in] timeout_ms  HAL polling 发送 timeout。
+ * @param[in] frame  Ethernet Frame，包含目的 MAC、源 MAC、EtherType 和 Payload，
+ *                   不包含 FCS。
+ * @param[in] length Frame 长度。
  *
- * @retval true   Frame 已发送完成。
- * @retval false  参数错误、Driver 未启动、无 TX Buffer 或 HAL 发送失败。
+ * @retval ETHERNET_TX_QUEUED Frame 已成功提交。
+ * @retval ETHERNET_TX_RETRY  当前无可用 Buffer 或 HAL 暂时无法接收，可稍后重试。
+ * @retval ETHERNET_TX_ERROR  参数无效或 Driver 尚未启动。
  */
-bool EthernetDriver_Transmit(const uint8_t *frame, uint16_t length, uint32_t timeout_ms)
+EthernetTxResult EthernetDriver_TransmitAsync(const uint8_t *frame, uint16_t length)
 {
     ETH_HandleTypeDef *eth_handle = EthernetPort_GetHandle();
     ETH_BufferTypeDef hal_buffer = {0};
     ETH_TxPacketConfigTypeDef tx_config = {0};
     uint8_t *dma_buffer;
     HAL_StatusTypeDef hal_status;
+    uint32_t primask;
 
     if ((eth_handle == NULL) ||
         (frame == NULL) ||
@@ -271,41 +336,88 @@ bool EthernetDriver_Transmit(const uint8_t *frame, uint16_t length, uint32_t tim
         (length > ETHERNET_DMA_BUFFER_SIZE) ||
         (eth_handle->gState != HAL_ETH_STATE_STARTED))
     {
-        return false;
+        return ETHERNET_TX_ERROR;
     }
+
+    /*
+     * Backstop：
+     * 即使 TX complete Task 尚未来得及运行，也先尝试回收已经完成的包。
+     */
+    EthernetDriver_ProcessTxCompletions();
 
     dma_buffer = EthernetDriver_AcquireTxBuffer();
 
     if (dma_buffer == NULL)
     {
-        return false;
+        return ETHERNET_TX_RETRY;
     }
 
+    /*
+     * copy 完成后，caller 原始 frame 生命周期即可结束。
+     */
     memcpy(dma_buffer, frame, length);
 
     hal_buffer.buffer = dma_buffer;
     hal_buffer.len = length;
     hal_buffer.next = NULL;
 
-    tx_config.Attributes =
-        ETH_TX_PACKETS_FEATURES_CRCPAD |
-        ETH_TX_PACKETS_FEATURES_SAIC;
-
+    tx_config.Attributes =ETH_TX_PACKETS_FEATURES_CRCPAD | ETH_TX_PACKETS_FEATURES_SAIC;
     tx_config.Length = length;
     tx_config.TxBuffer = &hal_buffer;
     tx_config.SrcAddrCtrl = ETH_SRC_ADDR_REPLACE;
     tx_config.CRCPadCtrl = ETH_CRC_PAD_INSERT;
+
+    /*
+     * HAL 会保存该地址，并在 HAL_ETH_ReleaseTxPacket()
+     * 中把它传给 HAL_ETH_TxFreeCallback()。
+     */
     tx_config.pData = dma_buffer;
 
-    hal_status = HAL_ETH_Transmit(eth_handle, &tx_config, timeout_ms);
+    primask = EthernetDriver_EnterCritical();
+
+    hal_status = HAL_ETH_Transmit_IT(
+        eth_handle,
+        &tx_config);
+
+    EthernetDriver_ExitCritical(primask);
 
     if (hal_status == HAL_OK)
     {
-        EthernetDriver_ReleaseTxBuffer(dma_buffer);
-        return true;
+        return ETHERNET_TX_QUEUED;
     }
 
-    return false;
+    /*
+     * 当前单 Buffer、无 VLAN/TSO 路径下，未成功提交意味着
+     * dma_buffer 尚未进入正常 DMA ownership，可归还 Driver Pool。
+     */
+    EthernetDriver_ReleaseTxBuffer(dma_buffer);
+
+    return ETHERNET_TX_RETRY;
+}
+
+/**
+ * @brief  回收所有已完成发送的 TX Packet 和 DMA Buffer。
+ *
+ * @details
+ * 调用 HAL 释放已完成的 TX Descriptor，并通过 HAL_ETH_TxFreeCallback()
+ * 将对应 DMA Buffer 归还 Driver Pool。本函数应在任务上下文调用。
+ */
+void EthernetDriver_ProcessTxCompletions(void)
+{
+    ETH_HandleTypeDef *eth_handle = EthernetPort_GetHandle();
+    uint32_t primask;
+
+    if ((eth_handle == NULL) ||
+        (eth_handle->gState != HAL_ETH_STATE_STARTED))
+    {
+        return;
+    }
+
+    primask = EthernetDriver_EnterCritical();
+
+    (void)HAL_ETH_ReleaseTxPacket(eth_handle);
+
+    EthernetDriver_ExitCritical(primask);
 }
 
 /**
@@ -445,5 +557,38 @@ void HAL_ETH_RxCpltCallback(ETH_HandleTypeDef *heth)
     if (handler != NULL)
     {
         handler(context);
+    }
+}
+
+/**
+ * @brief  HAL TX complete callback。
+ *
+ * @details
+ * ISR 中只发送 completion event，不直接回收 TX Descriptor。
+ */
+void HAL_ETH_TxCpltCallback(ETH_HandleTypeDef *heth)
+{
+    EthernetDriverTxEventHandler handler = g_tx_event_handler;
+    void *context = g_tx_event_context;
+
+    (void)heth;
+
+    if (handler != NULL)
+    {
+        handler(context);
+    }
+}
+
+/**
+ * @brief  HAL TX packet free callback。
+ *
+ * @details
+ * 由 HAL_ETH_ReleaseTxPacket() 在任务上下文调用。
+ */
+void HAL_ETH_TxFreeCallback(uint32_t *buffer)
+{
+    if (buffer != NULL)
+    {
+        EthernetDriver_ReleaseTxBuffer((uint8_t *)buffer);
     }
 }

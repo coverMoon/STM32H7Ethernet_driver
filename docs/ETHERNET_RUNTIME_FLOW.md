@@ -47,7 +47,7 @@ Application / LwIP
 
 理解当前代码时，不要把所有 callback 当成同一种机制。实际上共有三类完全不同的机制。
 
-## 2. 三类 callback / 函数替换机制
+## 2.  callback / 函数替换机制
 
 ### 2.1 `__weak`：链接阶段的实现替换
 
@@ -89,9 +89,7 @@ strong EthernetRtos_RxTask
 最终使用 strong implementation
 ```
 
-因此 `As weak` 不是运行时 callback 注册。
-
-它只解决一个构建边界问题：
+其解决一个构建边界问题：
 
 ```text
 CubeMX
@@ -113,10 +111,6 @@ HAL_ETH_RxAllocateCallback()
 HAL_ETH_RxLinkCallback()
 ```
 
-这类函数也不是项目在运行时通过 `SetHandler()` 注册的。
-
-它们是 STM32 HAL 预留的固定插槽：HAL 在特定时机会主动调用这些名字对应的实现。
-
 可以理解为：
 
 ```text
@@ -132,7 +126,7 @@ HAL
 
 当前 Driver Package 提供这些 callback 的强定义。
 
-### 2.3 `Set...Handler()`：真正的运行时注册
+### 2.3 `Set...Handler()`：运行时注册
 
 当前真正的运行时函数指针注册只有两层：
 
@@ -254,7 +248,7 @@ EthernetRxTask
 → 负责等待 RX event 并在任务上下文读取 Frame
 ```
 
-两者职责必须分开理解。
+两者职责需要分开理解。
 
 ## 5. RX Task 启动时做什么
 
