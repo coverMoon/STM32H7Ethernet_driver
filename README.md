@@ -11,8 +11,6 @@ Interface : RMII
 RTOS      : FreeRTOS / CMSIS-RTOS2
 ```
 
-仓库的产品是根目录下的 [`Ethernet/`](Ethernet/)；完整 STM32CubeMX 参考工程位于 [`examples/STM32H743_LAN8720_FreeRTOS/`](examples/STM32H743_LAN8720_FreeRTOS/)。参考工程用于展示一套已验证接入方式，不代表 Driver 必须使用 CMake、GNU Arm、特定 SRAM 地址或特定 PCB。
-
 ## 1. Driver Package 架构
 
 ```text
@@ -122,7 +120,7 @@ TXD0
 TXD1
 ```
 
-这些引脚必须按目标 PCB / 原理图配置。当前参考板使用 LAN8720AI，并由 PHY 向 STM32 输入 RMII REF_CLK；不要照抄当前 GPIO 到其他板。
+这些引脚必须按目标 PCB / 原理图配置。当前参考板使用 LAN8720AI，并由 PHY 向 STM32 输入 RMII REF_CLK。
 
 如果 PHY 有独立 `nRST`，建议把它配置成普通 GPIO Output，并在 Port 中实现 Reset Assert / Release。
 
@@ -226,13 +224,13 @@ lifetime
 应用只需创建一个 Task，并让其最终执行：
 
 ```c
-EthernetRtos_RxTask(void *argument);
+EthernetRtos_RuntimeTask(void *argument);
 ```
 
 当前 Reference Example 已验证的 CubeMX 集成方式是 **As weak**：
 
 ```text
-Task Entry : EthernetRtos_RxTask
+Task Entry : EthernetRtos_RuntimeTask
 Generation : As weak
 ```
 
@@ -242,7 +240,7 @@ CubeMX 负责生成 Task Object、priority、stack、allocation 和 `osThreadNew
 
 ## 4. DMA 内存设计
 
-### 4.1 为什么普通 static 数组不够
+### 4.1 普通 static 数组的局限
 
 例如：
 
@@ -309,7 +307,7 @@ EthernetPort_PrepareDmaMemory();
 
 ## 5. Linker 配置
 
-Driver 只定义 input section 名，目标工程决定物理地址。
+Driver 只定义 input section 名，目标工程决定物理地址。具体修改位置位于.`ld`文件中，示例中使用的链接文件为`example/STM32H743xx_FLASH.ld` ，若使用相同芯片且无其他内存配置，可直接复制使用。接下来就其中内容进行讲解。
 
 ### 5.1 MEMORY
 
@@ -479,7 +477,7 @@ void EthernetPort_PhyResetRelease(void)
 
 通用 `ethernet_driver.c` / `ethernet_mdio.c` 不应 include 某个 Demo 的 `eth.h`，也不应假设 HAL Handle 一定叫 `heth`。
 
-## 7. 把源码加入构建系统
+## 7. 将源码加入构建系统
 
 Driver 是普通 C 源码，不依赖本仓库 CMake。根据是否使用 LAN8720 / CMSIS-RTOS2，加入对应文件。
 
@@ -628,43 +626,7 @@ void MyRxHandler(const uint8_t *frame, uint16_t length, void *context);
 
 ISR / HAL RX complete callback 中禁止执行协议解析、应用业务、`printf`、长循环或阻塞操作。
 
-## 11. 新板迁移检查表
-
-迁移前至少重新确认：
-
-- MCU 精确型号是否包含 Ethernet MAC；
-- RMII / MII 模式与全部引脚；
-- PHY 型号、PHY Address、Reset、strap 和 REF_CLK 方向；
-- Ethernet DMA Master 可访问哪些 SRAM；
-- SRAM clock 是否需要显式开启；
-- Descriptor 数量和 HAL Descriptor 实际大小；
-- RX/TX Pool 数量、大小、32-byte alignment；
-- MPU Base / Size / Memory Attribute / overlap priority；
-- D-Cache 是否开启以及一致性方案；
-- linker MEMORY、Descriptor section、Buffer section 和 ASSERT；
-- ETH IRQ priority 是否满足 RTOS FromISR 规则；
-- `.map` / ELF 中实际地址是否符合设计。
-
-建议按以下顺序上板：
-
-```text
-PHY Reset
-→ MDIO Read/Write
-→ PHY ID / Address / Strap
-→ Auto-negotiation
-→ Link / Speed / Duplex
-→ Raw TX
-→ Raw RX
-→ 连续 RX recycle
-→ ETH IRQ / RTOS async RX
-→ ethernetif / LwIP / Ping
-→ UDP / TCP
-→ Stress
-```
-
-每个结果区分 Static Review、Build Verified、On-board Verified、Measured。
-
-## 12. Reference Example
+## 11. Reference Example
 
 完整参考工程：
 
