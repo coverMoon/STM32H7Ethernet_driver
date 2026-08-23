@@ -58,6 +58,9 @@
 #define ETHERNET_ASYNC_TX_TEST_ENABLE       1
 #define ETHERNET_TX_TEST_TARGET_COUNT    1000U
 #define ETHERNET_TX_TEST_RETRY_TIMEOUT_MS 5000U
+
+#define ETHERNET_TX_TEST_COMPLETION_TIMEOUT_MS 5000U
+#define ETHERNET_STATS_PRINT_PERIOD_MS 2000U
 /* USER CODE END PD */
 
 /* Private macro -------------------------------------------------------------*/
@@ -68,7 +71,7 @@
 /* Private variables ---------------------------------------------------------*/
 /* USER CODE BEGIN Variables */
 static uint32_t g_ethernet_rx_frame_count;
-static uint32_t g_ethernet_rx_test_frame_count;
+static volatile uint32_t g_ethernet_rx_test_frame_count;
 /* USER CODE END Variables */
 /* Definitions for BootstrapTask */
 osThreadId_t BootstrapTaskHandle;
@@ -300,60 +303,32 @@ void StartBootstrapTask(void *argument)
     }
   }
 
-  /*
-   * 周期轮询 PHY Link。
-   *
-   * 当前工作单元只收敛 PHY API，不在这里实现完整 MAC
-   * Link Down / Up lifecycle。此循环仍只负责状态观测和日志。
-   */
+  uint32_t stats_elapsed_ms = 0U;
+
   for (;;)
   {
-    Lan8720Status current_phy_status = {0};
+    stats_elapsed_ms += PHY_LINK_POLL_PERIOD_MS;
 
-    phy_result = Lan8720_GetStatus(
-      LAN8720_PHY_ADDRESS,
-      &current_phy_status);
-
-    if (phy_result == LAN8720_RESULT_OK)
+    if (stats_elapsed_ms >= ETHERNET_STATS_PRINT_PERIOD_MS)
     {
-      if (!last_status_valid ||
-          (current_phy_status.link_up !=
-           last_phy_status.link_up))
+      EthernetDriverStats stats = {0};
+
+      if (EthernetDriver_GetStats(&stats))
       {
-        if (current_phy_status.link_up)
-        {
-          printf("[PHY] Link up\r\n");
-
-          if (current_phy_status.speed ==
-              LAN8720_SPEED_100M)
-          {
-            printf("[PHY] Speed=100M\r\n");
-          }
-          else if (current_phy_status.speed ==
-                   LAN8720_SPEED_10M)
-          {
-            printf("[PHY] Speed=10M\r\n");
-          }
-
-          if (current_phy_status.duplex ==
-              LAN8720_DUPLEX_FULL)
-          {
-            printf("[PHY] Duplex=Full\r\n");
-          }
-          else if (current_phy_status.duplex ==
-                   LAN8720_DUPLEX_HALF)
-          {
-            printf("[PHY] Duplex=Half\r\n");
-          }
-        }
-        else
-        {
-          printf("[PHY] Link down\r\n");
-        }
-
-        last_phy_status = current_phy_status;
-        last_status_valid = true;
+        printf(
+          "[ETH][STAT] test=%lu rx=%lu err=%lu "
+          "drop=%lu no_buf=%lu hal=%lu "
+          "dma=0x%08lX\r\n",
+          (unsigned long)g_ethernet_rx_test_frame_count,
+          (unsigned long)stats.rx_frames,
+          (unsigned long)stats.rx_errors,
+          (unsigned long)stats.rx_dropped,
+          (unsigned long)stats.rx_buffer_unavailable,
+          (unsigned long)stats.hal_error_events,
+          (unsigned long)stats.last_dma_error_code);
       }
+
+      stats_elapsed_ms = 0U;
     }
 
     osDelay(PHY_LINK_POLL_PERIOD_MS);
@@ -485,20 +460,37 @@ static void EthernetDemo_RxFrameHandler(const uint8_t *frame, uint16_t length, v
   {
     printf("[ETH] Async RX test 1000/1000 PASS, total=%lu\r\n",
            (unsigned long)g_ethernet_rx_frame_count);
+
+    EthernetDriverStats stats = {0};
+
+    if (EthernetDriver_GetStats(&stats))
+    {
+        printf(
+            "[ETH] RX stats: frames=%lu errors=%lu "
+            "dropped=%lu no_buffer=%lu "
+            "hal_errors=%lu dma=0x%08lX\r\n",
+            (unsigned long)stats.rx_frames,
+            (unsigned long)stats.rx_errors,
+            (unsigned long)stats.rx_dropped,
+            (unsigned long)stats.rx_buffer_unavailable,
+            (unsigned long)stats.hal_error_events,
+            (unsigned long)stats.last_dma_error_code);
+    }
   }
 }
 
 #if ETHERNET_ASYNC_TX_TEST_ENABLE
 
 /**
- * @brief  连续异步提交测试 Frame，验证 TX Buffer 回收和重试流程。
+ * @brief 连续异步提交测试 Frame，并验证 TX completion ownership。
  *
  * @details
- * Frame 尾部四字节写入发送序号；临时无可用资源时延时后重试，
- * 直到达到目标数量或超过重试等待时间。
+ * 先记录 Driver Stats 基线，然后提交指定数量 Frame。
+ * 全部提交完成后继续等待 TX Buffer completion recycle，
+ * 最终要求 queued 和 completed 增量都等于测试目标值。
  *
- * @retval true   所有测试 Frame 均已成功提交。
- * @retval false  Driver 返回错误或发送流程超时。
+ * @retval true   所有 Frame 均已提交并完成回收。
+ * @retval false  Driver error、提交超时或 completion 超时。
  */
 static bool EthernetDemo_RunAsyncTxTest(void)
 {
@@ -510,8 +502,18 @@ static bool EthernetDemo_RunAsyncTxTest(void)
         'a', 's', 'y', 'n', 'c', ' ', 'T', 'X'
     };
 
+    EthernetDriverStats stats_before = {0};
+    EthernetDriverStats stats_after = {0};
+
     uint32_t queued = 0U;
     uint32_t retry_wait_ms = 0U;
+    uint32_t completion_wait_ms = 0U;
+
+    if (!EthernetDriver_GetStats(&stats_before))
+    {
+        printf("[ETH] Failed to get TX stats baseline\r\n");
+        return false;
+    }
 
     while (queued < ETHERNET_TX_TEST_TARGET_COUNT)
     {
@@ -522,9 +524,7 @@ static bool EthernetDemo_RunAsyncTxTest(void)
         test_frame[58] = (uint8_t)(queued >> 8);
         test_frame[59] = (uint8_t)queued;
 
-        result = EthernetDriver_TransmitAsync(
-            test_frame,
-            sizeof(test_frame));
+        result = EthernetDriver_TransmitAsync(test_frame, sizeof(test_frame));
 
         if (result == ETHERNET_TX_QUEUED)
         {
@@ -533,9 +533,7 @@ static bool EthernetDemo_RunAsyncTxTest(void)
 
             if ((queued % 100U) == 0U)
             {
-                printf(
-                    "[ETH] Async TX queued=%lu\r\n",
-                    (unsigned long)queued);
+                printf("[ETH] Async TX queued=%lu\r\n", (unsigned long)queued);
             }
 
             continue;
@@ -547,11 +545,10 @@ static bool EthernetDemo_RunAsyncTxTest(void)
             return false;
         }
 
-        if (retry_wait_ms >= ETHERNET_TX_TEST_RETRY_TIMEOUT_MS)
+        if (retry_wait_ms >=
+            ETHERNET_TX_TEST_RETRY_TIMEOUT_MS)
         {
-            printf(
-                "[ETH] Async TX stalled at %lu\r\n",
-                (unsigned long)queued);
+            printf("[ETH] Async TX stalled at %lu\r\n", (unsigned long)queued);
 
             return false;
         }
@@ -560,7 +557,59 @@ static bool EthernetDemo_RunAsyncTxTest(void)
         retry_wait_ms++;
     }
 
-    return true;
+    /*
+     * queued 只代表 HAL 已接收 Frame。
+     * 继续等待 tx_completed，确认所有 TX DMA Buffer 已真正归还。
+     */
+    while (completion_wait_ms < ETHERNET_TX_TEST_COMPLETION_TIMEOUT_MS)
+    {
+        uint32_t completed_delta;
+
+        if (!EthernetDriver_GetStats(&stats_after))
+        {
+            return false;
+        }
+
+        completed_delta = stats_after.tx_completed - stats_before.tx_completed;
+
+        if (completed_delta >= ETHERNET_TX_TEST_TARGET_COUNT)
+        {
+            break;
+        }
+
+        osDelay(1U);
+        completion_wait_ms++;
+    }
+
+    if (!EthernetDriver_GetStats(&stats_after))
+    {
+        return false;
+    }
+
+    printf(
+        "[ETH] TX stats: queued=%lu completed=%lu "
+        "retry=%lu error=%lu\r\n",
+        (unsigned long)(
+            stats_after.tx_queued -
+            stats_before.tx_queued),
+        (unsigned long)(
+            stats_after.tx_completed -
+            stats_before.tx_completed),
+        (unsigned long)(
+            stats_after.tx_retries -
+            stats_before.tx_retries),
+        (unsigned long)(
+            stats_after.tx_errors -
+            stats_before.tx_errors));
+
+    return ((stats_after.tx_queued -
+             stats_before.tx_queued) ==
+            ETHERNET_TX_TEST_TARGET_COUNT) &&
+           ((stats_after.tx_completed -
+             stats_before.tx_completed) ==
+            ETHERNET_TX_TEST_TARGET_COUNT) &&
+           ((stats_after.tx_errors -
+             stats_before.tx_errors) == 0U);
 }
 
 #endif

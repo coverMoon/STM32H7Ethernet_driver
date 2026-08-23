@@ -44,11 +44,17 @@ static void *g_rx_event_context;
 static EthernetDriverTxEventHandler g_tx_event_handler;
 static void *g_tx_event_context;
 
+static EthernetDriverStats g_stats;
+
 _Static_assert((ETHERNET_DMA_BUFFER_SIZE % ETHERNET_DMA_ALIGNMENT) == 0U,
                "Ethernet DMA buffer size must be cache-line aligned");
 
 /**
- * @brief  进入 Ethernet Driver TX Buffer 状态管理临界区。
+ * @brief 进入 Ethernet Driver 内部短临界区。
+ *
+ * @details
+ * 用于保护 Driver 中会被 Task / ISR 并发访问的短时软件状态。
+ * 临界区内不得执行等待、日志输出或大块数据复制。
  *
  * @return 进入临界区前的 PRIMASK，用于恢复原中断状态。
  */
@@ -62,13 +68,52 @@ static uint32_t EthernetDriver_EnterCritical(void)
 }
 
 /**
- * @brief  离开 Ethernet Driver TX Buffer 状态管理临界区。
+ * @brief 离开 Ethernet Driver 内部短临界区。
  *
  * @param[in] primask 进入临界区前保存的 PRIMASK。
  */
 static void EthernetDriver_ExitCritical(uint32_t primask)
 {
     __set_PRIMASK(primask);
+}
+
+/**
+ * @brief 原子增加一个 Driver 统计计数器。
+ *
+ * @param[in,out] counter 待增加的统计字段。
+ */
+static void EthernetDriver_IncrementCounter(uint32_t *counter)
+{
+    uint32_t primask;
+
+    if (counter == NULL)
+    {
+        return;
+    }
+
+    primask = EthernetDriver_EnterCritical();
+
+    (*counter)++;
+
+    EthernetDriver_ExitCritical(primask);
+}
+
+/**
+ * @brief 将当前正在组装的 RX Frame 标记为无效。
+ *
+ * @details
+ * 一个 Frame 即使跨多个 Descriptor 出现多个异常，也只统计一次 drop。
+ */
+static void EthernetDriver_InvalidateRxFrame(void)
+{
+    if (!g_rx_frame.valid)
+    {
+        return;
+    }
+
+    g_rx_frame.valid = false;
+
+    EthernetDriver_IncrementCounter(&g_stats.rx_dropped);
 }
 
 /**
@@ -120,12 +165,16 @@ static uint8_t *EthernetDriver_AcquireTxBuffer(void)
 }
 
 /**
- * @brief  释放一个 TX DMA Buffer。
+ * @brief 释放一个 TX DMA Buffer。
  *
  * @param[in] buffer TX DMA Buffer 地址。
+ *
+ * @retval true   Buffer 属于 TX Pool，已成功释放。
+ * @retval false  Buffer 不属于 TX Pool。
  */
-static void EthernetDriver_ReleaseTxBuffer(uint8_t *buffer)
+static bool EthernetDriver_ReleaseTxBuffer(uint8_t *buffer)
 {
+    bool released = false;
     uint32_t primask = EthernetDriver_EnterCritical();
 
     for (uint32_t i = 0U; i < ETH_TX_DESC_CNT; i++)
@@ -133,11 +182,14 @@ static void EthernetDriver_ReleaseTxBuffer(uint8_t *buffer)
         if (buffer == g_tx_dma_buffers[i])
         {
             g_tx_buffer_in_use[i] = false;
+            released = true;
             break;
         }
     }
 
     EthernetDriver_ExitCritical(primask);
+
+    return released;
 }
 
 /**
@@ -178,6 +230,7 @@ void EthernetDriver_Init(void)
 {
     memset(g_rx_buffer_in_use, 0, sizeof(g_rx_buffer_in_use));
     memset(g_tx_buffer_in_use, 0, sizeof(g_tx_buffer_in_use));
+    memset(&g_stats, 0, sizeof(g_stats));
 
     g_rx_frame.length = 0U;
     g_rx_frame.valid = false;
@@ -187,6 +240,35 @@ void EthernetDriver_Init(void)
 
     g_tx_event_handler = NULL;
     g_tx_event_context = NULL;
+}
+
+/**
+ * @brief 获取 Ethernet Driver 当前统计快照。
+ *
+ * @details
+ * 使用短临界区保证读取过程中不会被 ETH ISR 或其他 Task 更新一半。
+ *
+ * @param[out] stats 统计结果输出。
+ *
+ * @retval true   获取成功。
+ * @retval false  参数无效。
+ */
+bool EthernetDriver_GetStats(EthernetDriverStats *stats)
+{
+    uint32_t primask;
+
+    if (stats == NULL)
+    {
+        return false;
+    }
+
+    primask = EthernetDriver_EnterCritical();
+
+    *stats = g_stats;
+
+    EthernetDriver_ExitCritical(primask);
+
+    return true;
 }
 
 /**
@@ -336,6 +418,7 @@ EthernetTxResult EthernetDriver_TransmitAsync(const uint8_t *frame, uint16_t len
         (length > ETHERNET_DMA_BUFFER_SIZE) ||
         (eth_handle->gState != HAL_ETH_STATE_STARTED))
     {
+        EthernetDriver_IncrementCounter(&g_stats.tx_errors);
         return ETHERNET_TX_ERROR;
     }
 
@@ -349,6 +432,7 @@ EthernetTxResult EthernetDriver_TransmitAsync(const uint8_t *frame, uint16_t len
 
     if (dma_buffer == NULL)
     {
+        EthernetDriver_IncrementCounter(&g_stats.tx_retries);
         return ETHERNET_TX_RETRY;
     }
 
@@ -390,7 +474,8 @@ EthernetTxResult EthernetDriver_TransmitAsync(const uint8_t *frame, uint16_t len
      * 当前单 Buffer、无 VLAN/TSO 路径下，未成功提交意味着
      * dma_buffer 尚未进入正常 DMA ownership，可归还 Driver Pool。
      */
-    EthernetDriver_ReleaseTxBuffer(dma_buffer);
+    (void)EthernetDriver_ReleaseTxBuffer(dma_buffer);
+    EthernetDriver_IncrementCounter(&g_stats.tx_retries);
 
     return ETHERNET_TX_RETRY;
 }
@@ -442,6 +527,7 @@ EthernetRxResult EthernetDriver_Receive(uint8_t *frame, uint16_t capacity, uint1
         (capacity == 0U) ||
         (eth_handle->gState != HAL_ETH_STATE_STARTED))
     {
+        EthernetDriver_IncrementCounter(&g_stats.rx_errors);
         return ETHERNET_RX_ERROR;
     }
 
@@ -461,6 +547,9 @@ EthernetRxResult EthernetDriver_Receive(uint8_t *frame, uint16_t capacity, uint1
     {
         g_rx_frame.length = 0U;
         g_rx_frame.valid = false;
+
+        EthernetDriver_IncrementCounter(&g_stats.rx_errors);
+
         return ETHERNET_RX_ERROR;
     }
 
@@ -471,8 +560,16 @@ EthernetRxResult EthernetDriver_Receive(uint8_t *frame, uint16_t capacity, uint1
     g_rx_frame.length = 0U;
     g_rx_frame.valid = false;
 
+    EthernetDriver_IncrementCounter(&g_stats.rx_frames);
+
     return ETHERNET_RX_FRAME;
 }
+
+/****************************************************************************
+
+========================== HAL callbacks 区域 ================================
+
+*****************************************************************************/
 
 /**
  * @brief  为 HAL RX Descriptor 提供空闲 DMA Buffer。
@@ -497,6 +594,8 @@ void HAL_ETH_RxAllocateCallback(uint8_t **buffer)
             return;
         }
     }
+
+    EthernetDriver_IncrementCounter(&g_stats.rx_buffer_unavailable);
 }
 
 /**
@@ -513,6 +612,8 @@ void HAL_ETH_RxLinkCallback(void **pStart, void **pEnd, uint8_t *buffer, uint16_
         if (buffer != NULL)
         {
             (void)EthernetDriver_ReleaseRxBuffer(buffer);
+
+            EthernetDriver_IncrementCounter(&g_stats.rx_dropped);
         }
 
         return;
@@ -529,12 +630,12 @@ void HAL_ETH_RxLinkCallback(void **pStart, void **pEnd, uint8_t *buffer, uint16_
 
     if (!EthernetDriver_AppendRxData(buffer, length))
     {
-        g_rx_frame.valid = false;
+        EthernetDriver_InvalidateRxFrame();
     }
 
     if ((buffer == NULL) || !EthernetDriver_ReleaseRxBuffer(buffer))
     {
-        g_rx_frame.valid = false;
+        EthernetDriver_InvalidateRxFrame();
     }
 
     *pEnd = &g_rx_frame;
@@ -579,15 +680,44 @@ void HAL_ETH_TxCpltCallback(ETH_HandleTypeDef *heth)
 }
 
 /**
- * @brief  HAL TX packet free callback。
+ * @brief HAL TX packet free callback。
  *
  * @details
  * 由 HAL_ETH_ReleaseTxPacket() 在任务上下文调用。
+ * 只有 Driver TX Buffer 被实际识别并归还 Pool 后，才记为一次 TX completion。
  */
 void HAL_ETH_TxFreeCallback(uint32_t *buffer)
 {
-    if (buffer != NULL)
+    if ((buffer != NULL) && EthernetDriver_ReleaseTxBuffer((uint8_t *)buffer))
     {
-        EthernetDriver_ReleaseTxBuffer((uint8_t *)buffer);
+        EthernetDriver_IncrementCounter(&g_stats.tx_completed);
     }
+}
+
+/**
+ * @brief HAL Ethernet Error callback。
+ *
+ * @details
+ * ISR 中只保存错误统计和最近一次 HAL / DMA / MAC ErrorCode，
+ * 不执行 printf、DMA recovery、MAC restart 或协议处理。
+ *
+ * @param[in] heth Ethernet HAL Handle。
+ */
+void HAL_ETH_ErrorCallback(ETH_HandleTypeDef *heth)
+{
+    uint32_t primask;
+
+    if (heth == NULL)
+    {
+        return;
+    }
+
+    primask = EthernetDriver_EnterCritical();
+
+    g_stats.hal_error_events++;
+    g_stats.last_hal_error_code = HAL_ETH_GetError(heth);
+    g_stats.last_dma_error_code = HAL_ETH_GetDMAError(heth);
+    g_stats.last_mac_error_code = HAL_ETH_GetMACError(heth);
+
+    EthernetDriver_ExitCritical(primask);
 }
