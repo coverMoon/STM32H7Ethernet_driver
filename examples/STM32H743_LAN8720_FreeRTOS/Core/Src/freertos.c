@@ -44,8 +44,8 @@
 /* USER CODE BEGIN PD */
 #define LAN8720_PHY_ADDRESS                 0U
 
-#define PHY_READY_TIMEOUT_MS             100U
-#define PHY_READY_POLL_PERIOD_MS           5U
+#define PHY_INIT_TIMEOUT_MS              100U
+#define PHY_INIT_POLL_PERIOD_MS            5U
 
 #define AUTO_NEGOTIATION_TIMEOUT_MS      5000U
 #define AUTO_NEGOTIATION_POLL_PERIOD_MS   100U
@@ -154,141 +154,194 @@ void StartBootstrapTask(void *argument)
 {
   /* USER CODE BEGIN StartBootstrapTask */
   Lan8720Status phy_status = {0};
-  bool phy_ready = false;
-
   Lan8720Status last_phy_status = {0};
+  Lan8720Result phy_result = LAN8720_RESULT_NOT_READY;
+
   bool last_status_valid = false;
+  bool negotiation_ready = false;
 
   uint32_t elapsed_ms = 0U;
 
+  (void)argument;
+
   printf("[ETH] BootstrapTask started\r\n");
 
-  EthernetRtos_SetRxFrameHandler(
-    EthernetDemo_RxFrameHandler,
-    NULL);
+  EthernetRtos_SetRxFrameHandler(EthernetDemo_RxFrameHandler, NULL);
 
-  /* MX_GPIO_Init() 已经将 PHY nRST 拉低。等待上电稳定后释放 PHY 硬件复位。 */
+  /*
+   * MX_GPIO_Init() 已将 PHY nRST 拉低。
+   * 等待上电稳定后，由板级 Port 释放 PHY Hardware Reset。
+   */
   osDelay(25U);
   EthernetPort_PhyResetRelease();
 
-  while (elapsed_ms < PHY_READY_TIMEOUT_MS)
+  /*
+   * 初始化 LAN8720。
+   *
+   * Lan8720_Init() 只验证 PHY 并确保 Auto-negotiation 已启用，
+   * 不等待 Link Up，因此 timeout / retry 仍由 BootstrapTask 管理。
+   */
+  elapsed_ms = 0U;
+
+  while (elapsed_ms < PHY_INIT_TIMEOUT_MS)
   {
-    if (Lan8720_IsReady(LAN8720_PHY_ADDRESS))
+    phy_result = Lan8720_Init(LAN8720_PHY_ADDRESS);
+
+    if (phy_result == LAN8720_RESULT_OK)
     {
-      phy_ready = true;
       break;
     }
 
-    osDelay(PHY_READY_POLL_PERIOD_MS);
-    elapsed_ms += PHY_READY_POLL_PERIOD_MS;
+    /*
+     * 参数错误和 PHY ID 不匹配属于永久配置错误，
+     * 继续等待不会改变结果，因此立即结束初始化。
+     */
+    if ((phy_result == LAN8720_RESULT_ERROR_ARGUMENT) ||
+        (phy_result == LAN8720_RESULT_ERROR_ID))
+    {
+      break;
+    }
+
+    /*
+     * NOT_READY 和暂时的 MDIO 访问失败允许在 Reset 释放后短时间重试。
+     */
+    osDelay(PHY_INIT_POLL_PERIOD_MS);
+    elapsed_ms += PHY_INIT_POLL_PERIOD_MS;
   }
 
-  if (!phy_ready)
+  if (phy_result != LAN8720_RESULT_OK)
   {
-    printf("[ETH] PHY ready timeout\r\n");
+    printf(
+      "[ETH] PHY init failed, result=%d\r\n",
+      (int)phy_result);
   }
   else
   {
-    printf("[ETH] PHY ready\r\n");
+    printf("[ETH] PHY initialized\r\n");
+    printf("[ETH] Waiting for auto-negotiation\r\n");
 
-    if (!Lan8720_RestartAutoNegotiation(LAN8720_PHY_ADDRESS))
+    /*
+     * Hardware Reset 已经让 LAN8720 自行开始 Auto-negotiation。
+     * 此处只等待 PHY 报告协商完成，不再主动 Restart。
+     */
+    elapsed_ms = 0U;
+
+    while (elapsed_ms < AUTO_NEGOTIATION_TIMEOUT_MS)
     {
-      printf("[ETH] Auto-negotiation restart failed\r\n");
-    }
-    else
-    {
-      printf("[ETH] Auto-negotiation started\r\n");
+      phy_result = Lan8720_GetStatus(
+        LAN8720_PHY_ADDRESS,
+        &phy_status);
 
-      elapsed_ms = 0U;
-
-      while (elapsed_ms < AUTO_NEGOTIATION_TIMEOUT_MS)
+      if ((phy_result == LAN8720_RESULT_OK) &&
+          phy_status.link_up &&
+          phy_status.auto_negotiation_complete)
       {
-        if (!Lan8720_GetStatus(LAN8720_PHY_ADDRESS, &phy_status))
-        {
-          printf("[ETH] PHY status read failed\r\n");
-          break;
-        }
-
-        if (phy_status.auto_negotiation_complete && phy_status.link_up)
-        {
-          break;
-        }
-
-        osDelay(AUTO_NEGOTIATION_POLL_PERIOD_MS);
-        elapsed_ms += AUTO_NEGOTIATION_POLL_PERIOD_MS;
+        negotiation_ready = true;
+        break;
       }
 
-      if (phy_status.auto_negotiation_complete && phy_status.link_up)
+      /*
+       * 状态读取期间允许临时 NOT_READY / MDIO failure。
+       * timeout 仍由调用层统一控制。
+       */
+      osDelay(AUTO_NEGOTIATION_POLL_PERIOD_MS);
+      elapsed_ms += AUTO_NEGOTIATION_POLL_PERIOD_MS;
+    }
+
+    if (negotiation_ready)
+    {
+      printf("[ETH] Link up\r\n");
+
+      if (phy_status.speed == LAN8720_SPEED_100M)
       {
-        printf("[ETH] Link up\r\n");
-
-        if (phy_status.speed == LAN8720_SPEED_100M)
-        {
-          printf("[ETH] Speed=100M\r\n");
-        }
-        else if (phy_status.speed == LAN8720_SPEED_10M)
-        {
-          printf("[ETH] Speed=10M\r\n");
-        }
-
-        if (phy_status.duplex == LAN8720_DUPLEX_FULL)
-        {
-          printf("[ETH] Duplex=Full\r\n");
-        }
-        else if (phy_status.duplex == LAN8720_DUPLEX_HALF)
-        {
-          printf("[ETH] Duplex=Half\r\n");
-        }
-
-        if (EthernetBootstrap_StartMac(&phy_status))
-        {
-          printf("[ETH] MAC/DMA started\r\n");
-
-          #if ETHERNET_ASYNC_TX_TEST_ENABLE
-          if (EthernetDemo_RunAsyncTxTest())
-          {
-              printf("[ETH] Async TX queued 1000/1000\r\n");
-          }
-          #endif
-        }
-
-        last_phy_status = phy_status;
-        last_status_valid = true;
+        printf("[ETH] Speed=100M\r\n");
+      }
+      else if (phy_status.speed == LAN8720_SPEED_10M)
+      {
+        printf("[ETH] Speed=10M\r\n");
       }
       else
       {
-        printf("[ETH] Auto-negotiation timeout or link down\r\n");
+        printf("[ETH] Speed=Unknown\r\n");
       }
+
+      if (phy_status.duplex == LAN8720_DUPLEX_FULL)
+      {
+        printf("[ETH] Duplex=Full\r\n");
+      }
+      else if (phy_status.duplex == LAN8720_DUPLEX_HALF)
+      {
+        printf("[ETH] Duplex=Half\r\n");
+      }
+      else
+      {
+        printf("[ETH] Duplex=Unknown\r\n");
+      }
+
+      if (EthernetBootstrap_StartMac(&phy_status))
+      {
+        printf("[ETH] MAC/DMA started\r\n");
+
+        #if ETHERNET_ASYNC_TX_TEST_ENABLE
+        if (EthernetDemo_RunAsyncTxTest())
+        {
+          printf("[ETH] Async TX queued 1000/1000\r\n");
+        }
+        #endif
+      }
+
+      last_phy_status = phy_status;
+      last_status_valid = true;
+    }
+    else
+    {
+      printf(
+        "[ETH] Auto-negotiation timeout or link down\r\n");
     }
   }
 
-  /* Infinite loop */
-  for(;;)
+  /*
+   * 周期轮询 PHY Link。
+   *
+   * 当前工作单元只收敛 PHY API，不在这里实现完整 MAC
+   * Link Down / Up lifecycle。此循环仍只负责状态观测和日志。
+   */
+  for (;;)
   {
     Lan8720Status current_phy_status = {0};
 
-    if (Lan8720_GetStatus(LAN8720_PHY_ADDRESS, &current_phy_status))
+    phy_result = Lan8720_GetStatus(
+      LAN8720_PHY_ADDRESS,
+      &current_phy_status);
+
+    if (phy_result == LAN8720_RESULT_OK)
     {
-      if (!last_status_valid || current_phy_status.link_up != last_phy_status.link_up)
+      if (!last_status_valid ||
+          (current_phy_status.link_up !=
+           last_phy_status.link_up))
       {
         if (current_phy_status.link_up)
         {
           printf("[PHY] Link up\r\n");
 
-          if (current_phy_status.speed == LAN8720_SPEED_100M)
+          if (current_phy_status.speed ==
+              LAN8720_SPEED_100M)
           {
             printf("[PHY] Speed=100M\r\n");
           }
-          else if (current_phy_status.speed == LAN8720_SPEED_10M)
+          else if (current_phy_status.speed ==
+                   LAN8720_SPEED_10M)
           {
             printf("[PHY] Speed=10M\r\n");
           }
 
-          if (current_phy_status.duplex == LAN8720_DUPLEX_FULL)
+          if (current_phy_status.duplex ==
+              LAN8720_DUPLEX_FULL)
           {
             printf("[PHY] Duplex=Full\r\n");
           }
-          else if (current_phy_status.duplex == LAN8720_DUPLEX_HALF)
+          else if (current_phy_status.duplex ==
+                   LAN8720_DUPLEX_HALF)
           {
             printf("[PHY] Duplex=Half\r\n");
           }

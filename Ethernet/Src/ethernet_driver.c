@@ -407,8 +407,7 @@ void EthernetDriver_ProcessTxCompletions(void)
     ETH_HandleTypeDef *eth_handle = EthernetPort_GetHandle();
     uint32_t primask;
 
-    if ((eth_handle == NULL) ||
-        (eth_handle->gState != HAL_ETH_STATE_STARTED))
+    if ((eth_handle == NULL) || (eth_handle->gState != HAL_ETH_STATE_STARTED))
     {
         return;
     }

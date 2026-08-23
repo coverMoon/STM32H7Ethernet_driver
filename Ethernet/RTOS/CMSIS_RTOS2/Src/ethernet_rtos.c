@@ -64,23 +64,16 @@ static void EthernetRtos_ProcessRxFrames(void)
     for (;;)
     {
         uint16_t frame_length = 0U;
-        EthernetRxResult result = EthernetDriver_Receive(
-            g_rx_frame,
-            sizeof(g_rx_frame),
-            &frame_length);
+        EthernetRxResult result = EthernetDriver_Receive(g_rx_frame, sizeof(g_rx_frame), &frame_length);
 
-        if ((result == ETHERNET_RX_NONE) ||
-            (result == ETHERNET_RX_ERROR))
+        if ((result == ETHERNET_RX_NONE) || (result == ETHERNET_RX_ERROR))
         {
             return;
         }
 
         if (g_rx_frame_handler != NULL)
         {
-            g_rx_frame_handler(
-                g_rx_frame,
-                frame_length,
-                g_rx_frame_handler_context);
+            g_rx_frame_handler(g_rx_frame, frame_length, g_rx_frame_handler_context);
         }
     }
 }
@@ -136,10 +129,7 @@ void EthernetRtos_RuntimeTask(void *argument)
 
     for (;;)
     {
-        uint32_t flags = osThreadFlagsWait(
-            ETHERNET_EVENT_FLAGS,
-            osFlagsWaitAny,
-            osWaitForever);
+        uint32_t flags = osThreadFlagsWait(ETHERNET_EVENT_FLAGS, osFlagsWaitAny, osWaitForever);
 
         if ((flags & osFlagsError) != 0U)
         {
