@@ -1,6 +1,6 @@
 # Ethernet DMA / MPU / Cache Design
 
-本文记录 Driver 对 DMA 内存、Descriptor、Buffer、MPU、Cache 和 linker 的约束，并以 STM32H743 Reference Example 的已验证布局作为示例。完整用户接入流程以根 README 为准。
+本文记录 Driver 对 DMA 内存、Descriptor、Buffer、MPU、Cache 和 linker 的约束，并以 STM32H743 Reference Example 的已验证布局作为示例。完整用户接入流程以根 README 为准；RX/TX Runtime 调用链见 `docs/ETHERNET_RUNTIME_FLOW.md`。
 
 ## 1. 设计原则
 
@@ -162,32 +162,87 @@ Descriptor Count / Buffer Count / Buffer Size 变化后必须同步修改 linker
 ```text
 DMA owns RX Buffer
 → Frame received / IRQ
-→ RX Task calls HAL_ETH_ReadData()
+→ Runtime Task calls EthernetDriver_Receive()
+→ HAL_ETH_ReadData()
 → HAL_ETH_RxLinkCallback()
 → memcpy to Driver CPU-side frame storage
 → RX DMA Buffer immediately released to pool
 → HAL rebuilds descriptor and reallocates
-→ EthernetDriver_Receive() copies to caller frame
+→ EthernetDriver_Receive() copies to RTOS Adapter frame
+→ Frame Handler
 ```
 
 上层不会长期持有 DMA RX Buffer。copy-based ownership 已完成单帧、polling 1000/1000、async 1000/1000 上板验证。
 
+当前 RX 有两次 copy：
+
+```text
+DMA RX Buffer
+→ Driver CPU-side Frame
+→ RTOS Adapter Frame
+```
+
+第一版接受该开销以换取简单明确的 ownership。
+
 ## 7. TX ownership
 
-当前仍使用 polling：
+当前 TX 已切换为 copy-based async：
 
 ```text
 Caller Frame
 → acquire static TX DMA Buffer
 → memcpy
-→ HAL_ETH_Transmit(timeout)
-→ HAL_OK
-→ release TX Buffer
+→ HAL_ETH_Transmit_IT()
+→ HAL / DMA owns Buffer
+→ TX complete IRQ
+→ Runtime Task
+→ HAL_ETH_ReleaseTxPacket()
+→ HAL_ETH_TxFreeCallback()
+→ release TX Buffer to Driver Pool
 ```
 
-如果 HAL TX 返回错误，当前不立即把 Buffer 标记为空闲，因为 DMA ownership 可能尚未完全解除。完整 error recovery 与 async TX completion 后续单独设计。
+关键点：
 
-## 8. MPU
+1. `EthernetDriver_TransmitAsync()` 在提交前先尝试 `EthernetDriver_ProcessTxCompletions()`，作为 completion reclaim backstop；
+2. caller Frame 只在 `memcpy()` 前属于 caller，返回 `ETHERNET_TX_QUEUED` 后即可复用；
+3. `tx_config.pData` 保存 Driver TX DMA Buffer 地址，HAL 会把该地址记录到 `TxDescList.PacketAddress[]`；
+4. `HAL_ETH_ReleaseTxPacket()` 确认 Descriptor `OWN == 0` 后调用 `HAL_ETH_TxFreeCallback()`；
+5. `HAL_ETH_TxFreeCallback()` 最终把对应 Driver TX Buffer 标记为空闲；
+6. 当前没有隐藏的软件 TX Queue；无 Buffer/Descriptor 时返回 `ETHERNET_TX_RETRY`。
+
+当前 TX 只有一次 copy：
+
+```text
+Caller Frame
+→ Driver TX DMA Buffer
+→ DMA
+```
+
+## 8. TX submit / reclaim 并发保护
+
+`HAL_ETH_Transmit_IT()` 与 `HAL_ETH_ReleaseTxPacket()` 都会操作 HAL TX Descriptor bookkeeping：
+
+```text
+CurTxDesc
+PacketAddress[]
+BuffersInUse
+releaseIndex
+Descriptor OWN / IOC
+```
+
+当前 Driver 使用短 PRIMASK critical section 序列化：
+
+```text
+TX Pool acquire/release
+HAL_ETH_Transmit_IT()
+HAL_ETH_ReleaseTxPacket()
+```
+
+Frame `memcpy()` 不放在整个关中断区内。
+
+这个临界区用于保证 TX submit 与 reclaim 不并发破坏同一套 HAL/Driver ownership 状态；Driver Core 因此仍不依赖 FreeRTOS mutex。
+
+## 9. MPU
 
 当前 Example `.ioc` 配置 Cortex-M7 MPU，不使用 CubeMX Memory Management Tool 自动管理 Ethernet linker section。
 
@@ -224,7 +279,7 @@ Region 2 编号更高，因此：
 0x30040100 ~ 0x30047FFF  Normal / Non-cacheable
 ```
 
-## 9. D-Cache
+## 10. D-Cache
 
 当前 Example I-Cache / D-Cache Disabled，且 Ethernet SRAM3 Non-cacheable。
 
@@ -238,7 +293,7 @@ Region 2 编号更高，因此：
 
 在内存属性不变前，不提前往通用 Driver 加没有实际需求的 Cache maintenance 抽象。
 
-## 10. SRAM3 clock / Port
+## 11. SRAM3 clock / Port
 
 当前板 Port：
 
@@ -258,7 +313,7 @@ MPU_Config
 → EthernetDriver_Init
 ```
 
-## 11. CubeMX / MMT 边界
+## 12. CubeMX / MMT 边界
 
 ```text
 Example .ioc
@@ -281,7 +336,9 @@ Driver
 
 `cmake/stm32cubemx/CMakeLists.txt` 属于生成文件，不手工修改。
 
-## 12. Map / ELF 验证
+CubeMX 6.18.1 可能在 `.ioc` 内保留 MMT metadata，但当前 `MMTConfigApplied=false`；项目实际 DMA layout 仍以 linker + map/ELF 为准。
+
+## 13. Map / ELF 验证
 
 在 Reference Example 目录构建后：
 
@@ -293,7 +350,7 @@ arm-none-eabi-nm -n build/Debug/stm32H7ethernet_demo.elf | \
   grep -E "DMARxDscrTab|DMATxDscrTab"
 ```
 
-历史已验证：
+当前 Reference Example 迁移到 `examples/` 并完成 RuntimeTask / async TX 修改后，仍已验证：
 
 ```text
 DMARxDscrTab = 0x30040000
@@ -302,9 +359,27 @@ DMATxDscrTab = 0x30040080
 .eth_dma_tx  = 0x30044000 / 0x1800
 ```
 
-第二阶段目录迁移后需要重新检查一次新路径产物。
+## 14. 当前验证边界
 
-## 13. 跨板迁移
+已验证：
+
+```text
+RX copy-based ownership + async RX 1000/1000
+TX copy-based async ownership + 1000-frame completion recycle
+RuntimeTask 改名后的 RX 回归
+map / ELF DMA layout
+```
+
+尚未验证：
+
+```text
+D-Cache-on
+高负载 / 长时间 Stress
+DMA fatal / timeout recovery
+Link lifecycle 下的 Buffer/Descriptor recovery
+```
+
+## 15. 跨板迁移
 
 必须重新确认目标 MCU 的：DMA 可达 SRAM、容量、clock、MPU base/size/attribute、Descriptor/Buffer 地址、linker MEMORY、map/ELF 实际地址。
 

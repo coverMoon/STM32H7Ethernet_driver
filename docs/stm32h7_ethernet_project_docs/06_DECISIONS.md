@@ -208,6 +208,7 @@ examples/STM32H743_LAN8720_FreeRTOS/STM32H743xx_FLASH.ld
 
 - 状态：Accepted
 - 日期：2026-08-21
+- TX ownership 子项替代：D025
 
 ```text
 RX Buffer Count = 4
@@ -223,7 +224,9 @@ RX Pool = 0x30042000 / 0x1800
 TX Pool = 0x30044000 / 0x1800
 ```
 
-RX：DMA Buffer → HAL Link callback → copy CPU frame → 立即归还 pool。TX 当前 polling：caller → copy TX DMA Buffer → HAL_ETH_Transmit(timeout) → HAL_OK 后归还。TX error 不立即复用 Buffer，完整 recovery 后续设计。
+RX：DMA Buffer → HAL Link callback → copy CPU frame → 立即归还 pool。
+
+本决定建立时 TX 仍为 polling：caller → copy TX DMA Buffer → `HAL_ETH_Transmit(timeout)` → HAL_OK 后归还。该 TX polling ownership 已由 D025 的 async TX completion ownership 替代；Buffer Count / Size / Alignment、RX ownership 与 section 约束继续有效。
 
 ---
 
@@ -252,19 +255,24 @@ HAL Handle、PHY Reset、DMA SRAM clock 属于目标工程；物理 DMA 地址�
 
 - 状态：Accepted
 - 日期：2026-08-22
+- Task 命名/双向 Runtime 扩展：D024
 
-Driver Core 与 FreeRTOS/CMSIS-RTOS2 解耦。可选 `Ethernet/RTOS/CMSIS_RTOS2` Adapter 不创建 Task；Application/CubeMX 决定 Task priority、stack、allocation，Adapter 提供 `EthernetRtos_RxTask()`。
+Driver Core 与 FreeRTOS/CMSIS-RTOS2 解耦。可选 `Ethernet/RTOS/CMSIS_RTOS2` Adapter 不创建 Task；Application/CubeMX 决定 Task priority、stack、allocation。
+
+本决定建立时入口为 `EthernetRtos_RxTask()`，RX 路径为：
 
 ```text
 HAL_ETH_RxCpltCallback()
 → Driver generic RX event
 → CMSIS-RTOS2 Adapter
 → Thread Flag
-→ EthernetRtos_RxTask()
+→ Runtime Task
 → drain EthernetDriver_Receive()
 ```
 
 完整 Frame 在任务上下文通过同步 Handler 交付；Frame pointer 只在 Handler 调用期间有效。`0x88B5` 测试逻辑属于 Example。
+
+D024 将 Task 名称和职责扩展为 RX/TX 共用的 `EthernetRtos_RuntimeTask()`，但不改变本决定的 RX Frame 交付边界。
 
 ---
 
@@ -296,33 +304,106 @@ examples/STM32H743_LAN8720_FreeRTOS/
 
 ## D023 CubeMX Ethernet RX Task 生成方式
 
-- 状态：Accepted
+- 状态：Superseded
 - 日期：2026-08-22
+- 替代：D024
 
-当前 Reference Example 使用：
+当时 Reference Example 使用：
 
 ```text
 Task Entry : EthernetRtos_RxTask
 Generation : As weak
 ```
 
-CubeMX 6.18.1 实际生成行为已在当前 Example 中确认：
+CubeMX 6.18.1 已确认：CubeMX 继续生成 Task attributes、priority、stack、allocation 和 `osThreadNew()`；generated `freertos.c` 生成 weak stub；Package 提供同名强定义。
 
-- CubeMX 继续生成 Task attributes、priority、stack、allocation 和 `osThreadNew()`；
-- generated `freertos.c` 生成 `__weak void EthernetRtos_RxTask(void *argument)` stub；
-- `Ethernet/RTOS/CMSIS_RTOS2/Src/ethernet_rtos.c` 提供同名强定义；
-- 链接时由 Package 强定义承担实际 RX Task 行为。
+该方案已经完成 Generate Code、Debug/Release Build、map/ELF 检查和 On-board async RX 1000 / 1000 回归。
 
-该方案已完成 Generate Code、Debug/Release Build、map/ELF 检查和 On-board async RX 1000 / 1000 回归。
+后续由于同一任务同时承担 TX completion reclaim，D024 将 Task 名称和 Entry 更新为 `EthernetRuntime / EthernetRtos_RuntimeTask`，继续沿用 `As weak + Package strong implementation` 的构建边界。
 
-因此正式冻结边界：
+---
+
+## D024 Ethernet Runtime Task 与 RX/TX 事件边界
+
+- 状态：Accepted
+- 日期：2026-08-23
+- 替代：D023；扩展 D021 的 Task 命名与职责
+
+当前 Reference Example 使用：
 
 ```text
-CubeMX / Application
-→ 管理 Task object 与资源
-
-Ethernet Package
-→ 管理 EthernetRtos_RxTask() 实际实现
+Task Name  : EthernetRuntime
+Task Entry : EthernetRtos_RuntimeTask
+Generation : As weak
 ```
 
-非 CubeMX 用户仍可直接使用 RTOS API 创建 Task，并把入口指向 `EthernetRtos_RxTask()`。
+CubeMX 负责：
+
+```text
+Task object
+priority
+stack
+allocation
+osThreadNew()
+weak Task stub
+```
+
+Package 负责：
+
+```text
+EthernetRtos_RuntimeTask() strong implementation
+runtime task handle
+RX complete event registration
+TX complete event registration
+RX/TX Thread Flag wait
+RX drain
+TX completion reclaim
+```
+
+Runtime Task 启动时自动注册：
+
+```text
+EthernetDriver_SetRxEventHandler(EthernetRtos_OnRxEvent)
+EthernetDriver_SetTxEventHandler(EthernetRtos_OnTxEvent)
+```
+
+`EthernetRtos_IsReady()` 只有在两类 ISR event 都完成绑定后才为 true。
+
+RX/TX 共用一个 Runtime Task；同一次唤醒同时含 RX/TX flag 时，当前先处理 TX completion，再 drain RX。该方案已完成 CubeMX Generate Code、Build、async TX 上板测试以及 RuntimeTask 改名后的 async RX 1000 / 1000 回归。
+
+---
+
+## D025 第一版 Async TX completion ownership
+
+- 状态：Accepted
+- 日期：2026-08-23
+- 替代：D019 中 TX polling ownership 子项
+
+第一版 TX 使用 copy-based async ownership：
+
+```text
+Caller Frame
+→ copy Driver static TX DMA Buffer
+→ HAL_ETH_Transmit_IT()
+→ HAL / DMA ownership
+→ TX complete IRQ
+→ HAL_ETH_TxCpltCallback()
+→ Driver generic TX event
+→ EthernetRtos_RuntimeTask()
+→ EthernetDriver_ProcessTxCompletions()
+→ HAL_ETH_ReleaseTxPacket()
+→ HAL_ETH_TxFreeCallback()
+→ Driver TX Pool
+```
+
+规则：
+
+- `EthernetDriver_TransmitAsync()` 返回 `ETHERNET_TX_QUEUED` 后 caller 原始 Frame 可立即复用；
+- 当前不向 Application 暴露 per-frame TX completion callback；completion 主要用于 Driver 内部 Buffer recycle；
+- `ETHERNET_TX_RETRY` 表示临时没有 TX Buffer / Descriptor 等可用资源，Driver 不隐藏软件 TX Queue；
+- `tx_config.pData` 保存 Driver TX DMA Buffer 地址，HAL 通过 `PacketAddress[]` 在 `HAL_ETH_ReleaseTxPacket()` 时把该地址传给 `HAL_ETH_TxFreeCallback()`；
+- TX complete ISR 只做 event forwarding，不在 ISR 中 reclaim Descriptor / Buffer；
+- `EthernetDriver_TransmitAsync()` 在正式 submit 前执行一次 completion reclaim backstop；
+- `HAL_ETH_Transmit_IT()` 与 `HAL_ETH_ReleaseTxPacket()` 及 TX Pool acquire/release 用短 PRIMASK critical section 序列化，避免并发修改 HAL/Driver TX bookkeeping；Frame memcpy 不放在整个关中断区。
+
+该方案已完成连续 1000-frame async TX 上板测试，并在同一 RuntimeTask 结构下重新完成 async RX 1000 / 1000 回归。

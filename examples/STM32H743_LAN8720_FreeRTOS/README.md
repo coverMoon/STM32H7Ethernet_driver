@@ -151,12 +151,50 @@ DMATxDscrTab = 0x30040080
 ./flash.sh Debug --check
 ```
 
-## 7. 异步 RX 启动日志
+## 7. FreeRTOS Runtime Task
 
-正常启动参考输出：
+当前 CubeMX 配置已经冻结并验证：
 
 ```text
-[ETH] EthernetRxTask started
+Task Name  : EthernetRuntime
+Priority   : osPriorityAboveNormal
+Stack      : 256 Words
+Entry      : EthernetRtos_RuntimeTask
+Generation : As weak
+Allocation : Dynamic
+```
+
+CubeMX 负责：
+
+```text
+Task object
+priority
+stack
+allocation
+osThreadNew()
+weak Task stub
+```
+
+Package 中：
+
+```text
+Ethernet/RTOS/CMSIS_RTOS2/Src/ethernet_rtos.c
+```
+
+提供同名强定义 `EthernetRtos_RuntimeTask()`，最终负责：
+
+```text
+RX deferred processing
+TX completion reclaim
+```
+
+Driver Package 本身仍不创建 Task。
+
+## 8. 正常启动日志
+
+基础启动参考输出：
+
+```text
 [ETH] BootstrapTask started
 [ETH] PHY ready
 [ETH] Auto-negotiation started
@@ -166,51 +204,124 @@ DMATxDscrTab = 0x30040080
 [ETH] MAC/DMA started
 ```
 
-当前 Demo 使用 EtherType `0x88B5` 做 Raw Frame RX 验证。PC 连续发送 1000 帧、约 5 ms / Frame 时，已得到：
+Runtime Task 自身不在高速路径打印启动日志。
+
+## 9. Async RX 测试
+
+当前 Demo 使用 EtherType `0x88B5` 做 Raw Frame RX 验证。
+
+PC 连续发送 1000 帧时，已验证：
 
 ```text
 [ETH] Async RX test 1000/1000 PASS, total=1000
 ```
 
-该测试验证 IRQ → Thread Flag → RX Task → Driver Receive → Buffer recycle 的基础连续运行，不是吞吐极限或长时间 Stress Test。
-
-## 8. FreeRTOS Task 集成
-
-当前已验证代码仍由 CubeMX 创建 `EthernetRxTask`，其生成入口 wrapper 在 USER CODE 中注册 Demo Frame Handler，然后调用：
-
-```c
-EthernetRtos_RxTask(argument);
-```
-
-Driver Package 本身不创建 Task。
-
-长期推荐方向是让 CubeMX Task Entry 使用 `EthernetRtos_RxTask` 并选择 `As weak`：CubeMX 负责 Task Object / priority / stack / allocation，Package 提供强定义 Task Entry。CubeMX 6.18.1 的 `As weak` 生成行为已经从同版本工程确认，但本 Example 的 `.ioc` 尚未执行这一改法后的 Generate Code + Build + On-board 回归，因此目前不直接修改生成文件假装已经完成。
-
-在本 Example 上实际切换时，应通过 CubeMX UI 修改 Task code generation option，Generate Code 后检查：
-
-```bash
-git diff -- \
-  stm32H7ethernet_demo.ioc \
-  Core/Src/freertos.c
-```
-
-确认 CubeMX 生成 `__weak` Entry 且 `osThreadNew()` 仍由 CubeMX 管理，再重新执行 Debug / Release / 上板 RX 测试。
-
-## 9. 当前验证等级
-
-On-board Verified：
+当前 RX 路径：
 
 ```text
+ETH IRQ
+→ HAL_ETH_RxCpltCallback()
+→ RX Thread Flag
+→ EthernetRtos_RuntimeTask()
+→ EthernetDriver_Receive()
+→ RX Buffer recycle
+→ EthernetDemo_RxFrameHandler()
+```
+
+该测试验证基础连续 ownership，不是吞吐极限或长时间 Stress Test。
+
+## 10. Async TX 测试
+
+当前 Demo 默认启用：
+
+```text
+ETHERNET_ASYNC_TX_TEST_ENABLE = 1
+ETHERNET_TX_TEST_TARGET_COUNT = 1000
+```
+
+MAC/DMA 启动成功后，BootstrapTask 连续调用：
+
+```c
+EthernetDriver_TransmitAsync();
+```
+
+测试 Frame：
+
+```text
+Destination MAC : ff:ff:ff:ff:ff:ff
+EtherType       : 0x88B5
+Frame Length    : 60 B
+尾部 4 B        : 发送序号
+```
+
+临时没有 TX Buffer / Descriptor 时：
+
+```text
+ETHERNET_TX_RETRY
+→ osDelay(1)
+→ retry
+```
+
+每 100 帧输出一次：
+
+```text
+[ETH] Async TX queued=100
+...
+[ETH] Async TX queued=1000
+[ETH] Async TX queued 1000/1000
+```
+
+当前 TX completion 路径：
+
+```text
+HAL_ETH_Transmit_IT()
+→ TX IRQ
+→ HAL_ETH_TxCpltCallback()
+→ TX Thread Flag
+→ EthernetRtos_RuntimeTask()
+→ EthernetDriver_ProcessTxCompletions()
+→ HAL_ETH_ReleaseTxPacket()
+→ HAL_ETH_TxFreeCallback()
+→ TX Buffer recycle
+```
+
+该 1000-frame 测试已上板通过，并且完成后重新执行 async RX 1000 / 1000 回归也通过。
+
+## 11. 当前验证等级
+
+已确认：
+
+```text
+Static Review
+Debug Build
+Release Build
+map / ELF DMA layout
 PHY Reset / MDIO / ID / Address
 Auto-negotiation
 Link Up / Down
 100M Full Duplex
-Raw TX
-Raw RX
+Raw TX / RX
 Polling RX 1000 / 1000
-ETH IRQ + CMSIS-RTOS2 Async RX 1000 / 1000
+Async RX 1000 / 1000
+EthernetRuntime / As weak Task integration
+Async TX 1000-frame completion recycle
+RuntimeTask 改名后的 RX 1000 / 1000 regression
 ```
 
-Driver Package 第一轮重构后已经重新完成 Debug Build 和 Async RX 1000 / 1000 上板回归。
+未完成：
 
-本次把完整 Demo 移入 `examples/` 只改变仓库路径和 Example 构建引用，提交后仍需重新执行构建 / map / 上板回归，不能自动继承为新目录结构的 Build Verified / On-board Verified。
+```text
+RX/TX error/drop 统计
+DMA fatal / timeout recovery
+Link lifecycle
+Task stack high-water mark
+D-Cache-on
+高负载 / 长时间 Stress
+LwIP / Ping / UDP / TCP
+```
+
+运行时 callback、Thread Flag、RX/TX Buffer ownership 的完整原理说明见仓库根目录：
+
+```text
+docs/ETHERNET_RUNTIME_FLOW.md
+```

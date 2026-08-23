@@ -2,7 +2,7 @@
 
 本文描述 STM32H7 Ethernet Driver Package 的稳定分层、依赖方向和模块职责。当前验证硬件为 STM32H743VIT6 + LAN8720AI + RMII；Reference Example 位于 `examples/STM32H743_LAN8720_FreeRTOS/`。
 
-运行时 callback、weak symbol、IRQ/Task 交接和 RX Buffer ownership 的详细原理说明见：[`docs/ETHERNET_RUNTIME_FLOW.md`](../ETHERNET_RUNTIME_FLOW.md)。
+运行时 callback、weak symbol、IRQ/Task 交接以及 RX/TX Buffer ownership 的详细原理说明见：[`docs/ETHERNET_RUNTIME_FLOW.md`](../ETHERNET_RUNTIME_FLOW.md)。
 
 ## 1. 总体分层
 
@@ -83,40 +83,46 @@ PHY Driver 只通过 MDIO Wrapper 访问 PHY，不依赖 RTOS/LwIP；Reset 后�
 
 ```c
 void EthernetDriver_Init(void);
+void EthernetDriver_SetRxEventHandler(EthernetDriverRxEventHandler handler, void *context);
+void EthernetDriver_SetTxEventHandler(EthernetDriverTxEventHandler handler, void *context);
 bool EthernetDriver_ConfigureLink(EthernetLinkSpeed speed, EthernetDuplexMode duplex);
 bool EthernetDriver_Start(void);
-bool EthernetDriver_Transmit(const uint8_t *frame, uint16_t length, uint32_t timeout_ms);
+EthernetTxResult EthernetDriver_TransmitAsync(const uint8_t *frame, uint16_t length);
+void EthernetDriver_ProcessTxCompletions(void);
 EthernetRxResult EthernetDriver_Receive(uint8_t *frame, uint16_t capacity, uint16_t *length);
 ```
 
-另外提供轻量 RX event 注册：
+Driver Core 不依赖 FreeRTOS。HAL RX/TX complete callback 只向上转发 ISR event，不在 ISR 中执行 Frame 读取、Descriptor reclaim、协议解析或应用业务。
 
-```text
-EthernetDriver_SetRxEventHandler()
-```
+当前使用 4 RX + 4 TX Descriptor、4×1536 B RX Pool、4×1536 B TX Pool。
 
-HAL RX complete callback 由 Driver Core 接收，只向上转发 ISR event，不在 ISR 中读取 Frame。
-
-当前使用 4 RX + 4 TX Descriptor、4×1536 B RX Pool、4×1536 B TX Pool。第一版 copy-based ownership：
+### RX ownership
 
 ```text
 RX DMA Buffer
 → HAL_ETH_RxLinkCallback()
-→ copy 到 CPU 单帧暂存
+→ copy 到 Driver CPU 单帧暂存
 → 立即归还 RX Pool
 → EthernetDriver_Receive() copy 给调用者
 ```
 
-TX 当前仍为 polling：
+### TX ownership
 
 ```text
 caller frame
-→ copy 到 TX DMA Buffer
-→ HAL_ETH_Transmit(timeout)
-→ HAL_OK 后归还 Buffer
+→ copy 到 Driver TX DMA Buffer
+→ HAL_ETH_Transmit_IT()
+→ DMA owns Buffer
+→ TX complete event
+→ Runtime Task
+→ HAL_ETH_ReleaseTxPacket()
+→ HAL_ETH_TxFreeCallback()
+→ Buffer 回到 TX Pool
 ```
 
-异步 TX completion 尚未实现。
+`EthernetDriver_TransmitAsync()` 返回 `ETHERNET_TX_QUEUED` 后，caller 原始 Frame 即可复用；当前不暴露 per-frame application completion callback。临时资源不足返回 `ETHERNET_TX_RETRY`，Driver 不隐藏软件 TX Queue。
+
+TX submit 与 completion reclaim 会操作同一套 HAL Descriptor bookkeeping，当前 Driver 用短临界区序列化 `HAL_ETH_Transmit_IT()` / `HAL_ETH_ReleaseTxPacket()` 及 TX Pool ownership。
 
 ## 6. CMSIS-RTOS2 Adapter
 
@@ -131,20 +137,38 @@ Adapter 不创建 Task。应用/CubeMX 管理 Task object、priority、stack、a
 ```text
 EthernetRtos_SetRxFrameHandler()
 EthernetRtos_IsReady()
-EthernetRtos_RxTask()
+EthernetRtos_RuntimeTask()
+```
+
+Runtime Task 启动时自动绑定：
+
+```text
+EthernetDriver_SetRxEventHandler(EthernetRtos_OnRxEvent)
+EthernetDriver_SetTxEventHandler(EthernetRtos_OnTxEvent)
 ```
 
 运行链路：
 
 ```text
+RX:
 ETH IRQ
-→ HAL_ETH_IRQHandler()
 → HAL_ETH_RxCpltCallback()
 → Driver RX event
-→ osThreadFlagsSet()
-→ EthernetRtos_RxTask()
+→ RX Thread Flag
+→ EthernetRtos_RuntimeTask()
 → drain EthernetDriver_Receive() until ETHERNET_RX_NONE
 → synchronous Frame Handler
+
+TX:
+HAL_ETH_Transmit_IT()
+→ TX IRQ
+→ HAL_ETH_TxCpltCallback()
+→ Driver TX event
+→ TX Thread Flag
+→ EthernetRtos_RuntimeTask()
+→ EthernetDriver_ProcessTxCompletions()
+→ HAL_ETH_ReleaseTxPacket()
+→ HAL_ETH_TxFreeCallback()
 ```
 
 Frame Handler 在任务上下文执行，frame pointer 仅在 Handler 调用期间有效。
@@ -152,13 +176,33 @@ Frame Handler 在任务上下文执行，frame pointer 仅在 Handler 调用期�
 当前 Reference Example 已采用并验证：
 
 ```text
-Task Entry : EthernetRtos_RxTask
+Task Name  : EthernetRuntime
+Task Entry : EthernetRtos_RuntimeTask
 Generation : As weak
 ```
 
-CubeMX 管理 Task attributes / `osThreadNew()`，Package 提供同名强定义 Task Entry；Generate Code、Build 和 On-board async RX 回归均已通过。
+CubeMX 管理 Task attributes / `osThreadNew()`，Package 提供同名强定义 Task Entry；Generate Code、Build、async RX 与 async TX 上板回归均已通过。
 
-## 7. ethernetif / LwIP
+## 7. Runtime Handler 边界
+
+当前运行时函数指针注册：
+
+```text
+EthernetDriver_SetRxEventHandler()
+→ Driver → RTOS Adapter
+
+EthernetDriver_SetTxEventHandler()
+→ Driver → RTOS Adapter
+
+EthernetRtos_SetRxFrameHandler()
+→ RTOS Adapter → Application / ethernetif
+```
+
+前两项由 `EthernetRtos_RuntimeTask()` 内部自动完成；普通用户通常只需要设置 RX Frame Handler 并调用 async TX API。
+
+HAL 的 `HAL_ETH_RxCpltCallback()`、`HAL_ETH_RxLinkCallback()`、`HAL_ETH_RxAllocateCallback()`、`HAL_ETH_TxCpltCallback()`、`HAL_ETH_TxFreeCallback()` 属于 HAL 固定 callback，不要与上述运行时 Handler 注册混为一类。
+
+## 8. ethernetif / LwIP
 
 未来 `ethernetif` 位于 LwIP 与 Frame API 之间：
 
@@ -172,7 +216,7 @@ Ethernet Frame API / RTOS runtime
 
 当前 ethernetif / LwIP 尚未实现。Driver 不提前包含 pbuf、IP、Socket 或协议语义。
 
-## 8. DMA / MPU / linker 边界
+## 9. DMA / MPU / linker 边界
 
 物理 DMA 地址属于目标工程，不属于 Driver Package。必须显式确定：
 
@@ -187,7 +231,7 @@ Ethernet Frame API / RTOS runtime
 
 当前 STM32H743 Example 使用 SRAM3 `0x30040000 / 32 KiB`，Non-cacheable，前 256 B Device overlay。详细见 `03_MEMORY_DMA.md`。
 
-## 9. CubeMX 与维护边界
+## 10. CubeMX 与维护边界
 
 Reference Example 的 CubeMX/ST 管理内容：
 
@@ -203,7 +247,7 @@ Core 手工代码只进入 USER CODE；`cmake/stm32cubemx/CMakeLists.txt` 不手
 
 手工维护产品：`Ethernet/**`。板级 linker 和 Example CMake 属于 Reference Example 配置。
 
-## 10. 可移植性
+## 11. 可移植性
 
 换板时优先只改变：
 
@@ -217,8 +261,18 @@ Task / RTOS 资源配置
 
 不应因为 PCB 差异修改通用 Frame ownership、MDIO Wrapper、RTOS Adapter 或未来 ethernetif。
 
-## 11. 当前验证
+## 12. 当前验证
 
-已 On-board Verified：PHY bring-up、Raw TX/RX、polling RX 1000/1000、ETH IRQ + CMSIS-RTOS2 async RX 1000/1000。
+已 On-board Verified：
 
-Driver Package 化、Reference Example 移入 `examples/`、CubeMX `As weak` Task Entry 方案均已完成 Build / map / On-board 回归。
+```text
+PHY bring-up
+Raw TX/RX
+polling RX 1000/1000
+async RX 1000/1000
+async TX 1000-frame continuous submit / completion recycle
+EthernetRuntime + EthernetRtos_RuntimeTask + As weak
+RuntimeTask 改名后的 RX 1000/1000 回归
+```
+
+Driver Package 化、Reference Example 移入 `examples/`、CubeMX Runtime Task 方案均已完成 Build / map / On-board 回归。

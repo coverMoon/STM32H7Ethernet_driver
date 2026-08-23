@@ -34,8 +34,8 @@
 - [x] MPU — Static Review + Build Verified；
 - [x] SRAM3 clock 在 MX_ETH_Init 前准备；
 - [x] RX ownership / recycle — On-board Verified；
-- [x] TX polling success ownership — On-board Verified；
-- [ ] TX error / timeout 完整 recovery；
+- [x] TX copy-based async ownership / recycle — On-board Verified；
+- [ ] TX 异常路径完整 recovery；
 - [ ] D-Cache-on。
 
 基线布局：
@@ -47,34 +47,64 @@ DMATxDscrTab = 0x30040080
 .eth_dma_tx  = 0x30044000 / 0x1800
 ```
 
-### 2. Raw Frame
+### 2. Raw Frame / RX
 
-- [x] Raw TX；
+- [x] Raw TX baseline；
 - [x] Raw RX 单帧；
 - [x] polling RX 1000 / 1000；
-- [x] async RX 1000 / 1000。
+- [x] async RX 1000 / 1000；
+- [x] `EthernetRtos_RuntimeTask()` 改名与 TX completion 加入后的 async RX 1000 / 1000 回归。
 
-当前测试 EtherType `0x88B5`，PC 间隔约 5 ms / Frame。1000 / 1000 只验证基础连续 ownership，不是 Stress。
+当前 RX 测试 EtherType `0x88B5`，PC 基础回归约 5 ms / Frame。1000 / 1000 只验证基础连续 ownership，不是 Stress。
 
-### 3. ETH IRQ + CMSIS-RTOS2
+### 3. ETH IRQ + CMSIS-RTOS2 Runtime
 
 - [x] ETH_IRQn；
-- [x] IRQ priority 满足当前 FreeRTOS FromISR 约束；
+- [x] IRQ priority 满足当前 FreeRTOS ISR API 约束；
 - [x] `ETH_IRQHandler()` → HAL handler；
 - [x] `HAL_ETH_Start_IT()`；
 - [x] HAL RX complete → Driver RX event；
-- [x] Thread Flag；
-- [x] RX Task task-context receive；
-- [x] 每次唤醒 drain 到 `ETHERNET_RX_NONE`；
-- [x] async RX 1000 / 1000。
+- [x] HAL TX complete → Driver TX event；
+- [x] RX/TX Thread Flags；
+- [x] `EthernetRtos_RuntimeTask()`；
+- [x] RX 每次唤醒 drain 到 `ETHERNET_RX_NONE`；
+- [x] TX completion task-side reclaim；
+- [x] async RX 1000 / 1000；
+- [x] async TX 1000-frame test。
 
-### 4. Driver Package 第一轮回归
+### 4. Async TX completion ownership
 
-- [x] Debug Build；
-- [x] PHY / MAC startup；
-- [x] Package 化后 async RX 1000 / 1000。
+当前路径：
 
-### 5. 第二阶段 Reference Example 目录回归
+```text
+EthernetDriver_TransmitAsync()
+→ copy Driver TX DMA Buffer
+→ HAL_ETH_Transmit_IT()
+→ TX IRQ
+→ HAL_ETH_TxCpltCallback()
+→ Driver TX event
+→ Runtime Task
+→ EthernetDriver_ProcessTxCompletions()
+→ HAL_ETH_ReleaseTxPacket()
+→ HAL_ETH_TxFreeCallback()
+→ TX Buffer recycle
+```
+
+已完成：
+
+- [x] 4×1536 B TX static pool；
+- [x] `ETHERNET_TX_QUEUED / RETRY / ERROR`；
+- [x] submit 前 completion reclaim backstop；
+- [x] TX submit / reclaim 短 critical section 序列化；
+- [x] HAL `pData` → `PacketAddress[]` → `TxFreeCallback()` ownership；
+- [x] TX complete ISR 只通知，不直接 reclaim；
+- [x] Runtime Task `HAL_ETH_ReleaseTxPacket()`；
+- [x] 连续 1000-frame async TX 上板测试通过；
+- [x] 测试后 RX 1000 / 1000 回归通过。
+
+该结果验证基础 completion ownership 与 Buffer recycle，不代表高负载吞吐或异常 recovery。
+
+### 5. Driver Package / Reference Example 回归
 
 Reference Example 当前路径：
 
@@ -90,36 +120,34 @@ examples/STM32H743_LAN8720_FreeRTOS/
 - [x] map / ELF RX/TX Pool；
 - [x] PHY / MAC startup；
 - [x] async RX 1000 / 1000；
-- [x] 无新增 HardFault / DMA Error；
-- [x] CubeMX Generate Code 后目录与 USER CODE 边界保持正确。
+- [x] async TX 1000-frame completion recycle；
+- [x] 无新增 HardFault；
+- [x] CubeMX Generate Code 后 USER CODE 边界保持正确。
 
-因此 Reference Example 移入 `examples/` 后的结构已达到 Build / Map / On-board Verified。
+### 6. CubeMX Runtime Task generation 回归
 
-### 6. CubeMX Task generation 回归
-
-D023 采用：
+当前采用：
 
 ```text
-Entry      = EthernetRtos_RxTask
+Task Name  = EthernetRuntime
+Entry      = EthernetRtos_RuntimeTask
 Generation = As weak
 ```
 
 当前 Reference Example 已完成：
 
-- [x] CubeMX 6.18.1 UI 修改 Task；
+- [x] CubeMX 6.18.1 UI 配置；
 - [x] Generate Code；
 - [x] `.ioc` diff 符合预期；
 - [x] `freertos.c` 生成 `__weak` Task Entry；
 - [x] CubeMX 仍管理 Task attributes / `osThreadNew()`；
 - [x] Package 强定义链接无冲突；
-- [x] Debug / Release Build；
-- [x] async RX 1000 / 1000。
-
-D023 已从 Proposed 转为 Accepted。
+- [x] Build；
+- [x] async RX 回归；
+- [x] async TX completion 回归。
 
 ### 7. M2 仍未完成
 
-- [ ] Async TX completion；
 - [ ] RX/TX error / drop 统计；
 - [ ] DMA fatal / RBU / timeout recovery；
 - [ ] Link Down / Up 完整 MAC lifecycle；
