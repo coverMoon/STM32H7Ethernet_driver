@@ -250,7 +250,7 @@ SECTIONS
     . = ALIGN(32);
   } >RAM_ETH
   
-  .TxDescripSection 0x30040080 (NOLOAD) :
+  .TxDescripSection 0x30040100 (NOLOAD) :
   {
     . = ALIGN(32);
     KEEP(*(.TxDescripSection))
@@ -260,13 +260,13 @@ SECTIONS
   ASSERT(ADDR(.RxDescripSection) == 0x30040000,
          "Ethernet RX descriptor address mismatch")
 
-  ASSERT(SIZEOF(.RxDescripSection) <= 0x80,
+  ASSERT(SIZEOF(.RxDescripSection) <= 0x100,
          "Ethernet RX descriptors exceed reserved slot")
 
   ASSERT(ADDR(.TxDescripSection) == 0x30040080,
          "Ethernet TX descriptor address mismatch")
 
-  ASSERT(SIZEOF(.TxDescripSection) <= 0x80,
+  ASSERT(SIZEOF(.TxDescripSection) <= 0x100,
          "Ethernet TX descriptors exceed reserved slot")
          
   ASSERT(SIZEOF(.RxDescripSection) > 0,
@@ -284,7 +284,7 @@ SECTIONS
   } >RAM_ETH
   
   /* Ethernet DMA TX buffers */
-  .eth_dma_tx 0x30044000 (NOLOAD) :
+  .eth_dma_tx 0x30045000 (NOLOAD) :
   {
     . = ALIGN(32);
     KEEP(*(.eth_dma_buffer.tx))
@@ -294,10 +294,10 @@ SECTIONS
   ASSERT(ADDR(.eth_dma_rx) == 0x30042000,
          "Ethernet RX buffer address mismatch")
 
-  ASSERT(SIZEOF(.eth_dma_rx) == 0x1800,
+  ASSERT(SIZEOF(.eth_dma_rx) == 0x3000,
          "Ethernet RX buffer pool size mismatch")
 
-  ASSERT(ADDR(.eth_dma_tx) == 0x30044000,
+  ASSERT(ADDR(.eth_dma_tx) == 0x30045000,
          "Ethernet TX buffer address mismatch")
 
   ASSERT(SIZEOF(.eth_dma_tx) == 0x1800,
