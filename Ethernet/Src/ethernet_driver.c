@@ -372,15 +372,6 @@ bool EthernetDriver_ConfigureLink(EthernetLinkSpeed speed, EthernetDuplexMode du
 /**
  * @brief  以中断模式启动 Ethernet MAC 和 DMA。
  *
- * @details
- * 保留 HAL_ETH_Start_IT() 的正常 RX complete / TX / fatal DMA interrupt 行为。
- * 启动成功后只关闭 Receive Buffer Unavailable interrupt source（RBUE），用于
- * 隔离高负载下 RBU abnormal interrupt storm 的 CPU 开销。RBU 本身仍可能在
- * DMACSR 中出现；当前 copy-first RX 仍通过 HAL_ETH_ReadData() 消费 Frame、
- * 重建 Descriptor 并更新 tail pointer，不依赖 ErrorCallback 才能恢复接收。
- *
- * 这是性能诊断阶段的单变量实验，不代表最终 recovery 策略已经冻结。
- *
  * @retval true   启动成功。
  * @retval false  Port、HAL 状态错误或启动失败。
  */
@@ -393,18 +384,7 @@ bool EthernetDriver_Start(void)
         return false;
     }
 
-    if (HAL_ETH_Start_IT(eth_handle) != HAL_OK)
-    {
-        return false;
-    }
-
-    /*
-     * 仅屏蔽专用 RBU interrupt；RIE / TIE / AIE / FBEE 等保持 HAL 配置。
-     * 这样可以单独测量 RBU Error IRQ storm 对 RX 热路径的影响。
-     */
-    __HAL_ETH_DMA_DISABLE_IT(eth_handle, ETH_DMACIER_RBUE);
-
-    return true;
+    return HAL_ETH_Start_IT(eth_handle) == HAL_OK;
 }
 
 /**

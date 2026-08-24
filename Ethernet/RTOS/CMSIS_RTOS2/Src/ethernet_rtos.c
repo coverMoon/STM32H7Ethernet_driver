@@ -20,6 +20,7 @@
  * - 不改变 RX ownership、IRQ 使能状态或 drain 策略；
  * - 将 ETHERNET_RX_FRAME / ETHERNET_RX_NONE 的 Receive() 耗时分别统计；
  * - 通过 GNU ld --wrap=HAL_ETH_ReadData 单独测量 HAL_ETH_ReadData()；
+ * - 通过 GNU ld --wrap=HAL_ETH_IRQHandler 单独测量 ETH IRQ handler；
  * - 仅在 RX 连续空闲 250 ms 后打印并清空本轮统计，避免串口干扰热路径。
  *
  * 当前计数面向 20 万帧量级的短时压力测试，cycle 累计使用 uint32_t；
@@ -57,6 +58,22 @@ typedef struct
     uint32_t hal_none_calls;
     uint32_t hal_none_cycles_total;
     uint32_t hal_none_cycles_max;
+
+    volatile uint32_t eth_irq_calls;
+    volatile uint32_t eth_irq_cycles_total;
+    volatile uint32_t eth_irq_cycles_max;
+
+    volatile uint32_t eth_irq_ri_only_calls;
+    volatile uint32_t eth_irq_ri_only_cycles_total;
+    volatile uint32_t eth_irq_ri_only_cycles_max;
+
+    volatile uint32_t eth_irq_rbu_calls;
+    volatile uint32_t eth_irq_rbu_cycles_total;
+    volatile uint32_t eth_irq_rbu_cycles_max;
+
+    volatile uint32_t eth_irq_other_calls;
+    volatile uint32_t eth_irq_other_cycles_total;
+    volatile uint32_t eth_irq_other_cycles_max;
 
     bool dwt_enabled;
 } EthernetRtosRxProfile;
@@ -96,6 +113,27 @@ __STATIC_FORCEINLINE void EthernetRtos_ProfileAccumulate(
 }
 
 /**
+ * @brief 累计 ISR 中的 cycle 测量结果。
+ *
+ * @details
+ * 这些字段只在 ETH ISR 中更新、在关中断快照中读取，因此不额外建立临界区。
+ */
+__STATIC_FORCEINLINE void EthernetRtos_ProfileAccumulateVolatile(
+    uint32_t cycles,
+    volatile uint32_t *calls,
+    volatile uint32_t *total,
+    volatile uint32_t *maximum)
+{
+    (*calls)++;
+    (*total) += cycles;
+
+    if (cycles > *maximum)
+    {
+        *maximum = cycles;
+    }
+}
+
+/**
  * @brief 启用 Cortex-M7 DWT cycle counter。
  *
  * @details
@@ -118,8 +156,8 @@ static void EthernetRtos_ProfileInit(void)
  * @brief 对本轮 profiling 做原子快照并清零热路径计数。
  *
  * @details
- * RX event 计数会在 ISR 中更新，因此快照期间短暂关闭中断。这里只复制几十字节
- * 软件状态，不执行 printf，也不做任何可能阻塞的操作。
+ * RX event 与 ETH IRQ 计数会在 ISR 中更新，因此快照期间短暂关闭中断。
+ * 这里只复制软件状态，不执行 printf，也不做任何可能阻塞的操作。
  */
 static bool EthernetRtos_ProfileTakeSnapshot(EthernetRtosRxProfile *snapshot)
 {
@@ -136,7 +174,8 @@ static bool EthernetRtos_ProfileTakeSnapshot(EthernetRtosRxProfile *snapshot)
 
     if ((g_rx_profile.frame_read_calls == 0U) &&
         (g_rx_profile.none_read_calls == 0U) &&
-        (g_rx_profile.error_read_calls == 0U))
+        (g_rx_profile.error_read_calls == 0U) &&
+        (g_rx_profile.eth_irq_calls == 0U))
     {
         __set_PRIMASK(primask);
         return false;
@@ -161,6 +200,9 @@ static bool EthernetRtos_ProfileTakeSnapshot(EthernetRtosRxProfile *snapshot)
  * HAL_ETH_ReadData() 本身。other_frame_avg / other_none_avg 是两层 wall-cycle
  * 均值之差，可近似表示 Driver 参数检查、返回路径、第二次 memcpy、统计更新以及
  * profiling wrapper 自身的少量开销，不应解释为某一个单独函数的精确耗时。
+ *
+ * 第三行统计 HAL_ETH_IRQHandler() 的 handler-body wall-cycle。rbu 分类优先于
+ * ri：同一次 IRQ 入口若同时存在 RI 与 RBU，计入 rbu；ri 只表示 RI-only。
  */
 static void EthernetRtos_ProfileReportIfNeeded(void)
 {
@@ -175,6 +217,10 @@ static void EthernetRtos_ProfileReportIfNeeded(void)
     uint32_t other_frame_avg = 0U;
     uint32_t other_none_avg = 0U;
     uint32_t hal_error_delta = 0U;
+    uint32_t irq_avg = 0U;
+    uint32_t irq_ri_avg = 0U;
+    uint32_t irq_rbu_avg = 0U;
+    uint32_t irq_other_avg = 0U;
 
     if (!EthernetRtos_ProfileTakeSnapshot(&profile))
     {
@@ -221,6 +267,32 @@ static void EthernetRtos_ProfileReportIfNeeded(void)
         other_none_avg = none_avg - hal_none_avg;
     }
 
+    if (profile.eth_irq_calls != 0U)
+    {
+        irq_avg = profile.eth_irq_cycles_total / profile.eth_irq_calls;
+    }
+
+    if (profile.eth_irq_ri_only_calls != 0U)
+    {
+        irq_ri_avg =
+            profile.eth_irq_ri_only_cycles_total /
+            profile.eth_irq_ri_only_calls;
+    }
+
+    if (profile.eth_irq_rbu_calls != 0U)
+    {
+        irq_rbu_avg =
+            profile.eth_irq_rbu_cycles_total /
+            profile.eth_irq_rbu_calls;
+    }
+
+    if (profile.eth_irq_other_calls != 0U)
+    {
+        irq_other_avg =
+            profile.eth_irq_other_cycles_total /
+            profile.eth_irq_other_calls;
+    }
+
     if (EthernetDriver_GetStats(&driver_stats))
     {
         hal_error_delta =
@@ -264,6 +336,24 @@ static void EthernetRtos_ProfileReportIfNeeded(void)
         (unsigned long)other_none_avg,
         (unsigned long)hal_error_delta,
         (unsigned long)driver_stats.last_dma_error_code);
+
+    printf(
+        "[ETH][PROFIRQ] total=%lu avg=%lu max=%lu "
+        "ri=%lu ri_avg=%lu ri_max=%lu "
+        "rbu=%lu rbu_avg=%lu rbu_max=%lu "
+        "other=%lu other_avg=%lu other_max=%lu\r\n",
+        (unsigned long)profile.eth_irq_calls,
+        (unsigned long)irq_avg,
+        (unsigned long)profile.eth_irq_cycles_max,
+        (unsigned long)profile.eth_irq_ri_only_calls,
+        (unsigned long)irq_ri_avg,
+        (unsigned long)profile.eth_irq_ri_only_cycles_max,
+        (unsigned long)profile.eth_irq_rbu_calls,
+        (unsigned long)irq_rbu_avg,
+        (unsigned long)profile.eth_irq_rbu_cycles_max,
+        (unsigned long)profile.eth_irq_other_calls,
+        (unsigned long)irq_other_avg,
+        (unsigned long)profile.eth_irq_other_cycles_max);
 }
 
 /*
@@ -315,6 +405,81 @@ HAL_StatusTypeDef __wrap_HAL_ETH_ReadData(
 
     return status;
 }
+
+/*
+ * 测量 HAL_ETH_IRQHandler() 函数体，并按 IRQ 入口时的 DMA 状态分类。
+ * DWT 区间不包含 Cortex-M7 exception entry / return 的硬件压栈开销。
+ */
+void __real_HAL_ETH_IRQHandler(ETH_HandleTypeDef *heth);
+
+void __wrap_HAL_ETH_IRQHandler(ETH_HandleTypeDef *heth)
+{
+    uint32_t dma_status = 0U;
+    uint32_t dma_itsource = 0U;
+    uint32_t start = 0U;
+    uint32_t cycles = 0U;
+    bool has_ri = false;
+    bool has_rbu = false;
+
+    if (heth != NULL)
+    {
+        dma_status = READ_REG(heth->Instance->DMACSR);
+        dma_itsource = READ_REG(heth->Instance->DMACIER);
+
+        has_ri =
+            ((dma_status & ETH_DMACSR_RI) != 0U) &&
+            ((dma_itsource & ETH_DMACIER_RIE) != 0U);
+        has_rbu =
+            ((dma_status & ETH_DMACSR_RBU) != 0U) &&
+            ((dma_itsource & ETH_DMACIER_RBUE) != 0U);
+    }
+
+    if (g_rx_profile.dwt_enabled)
+    {
+        start = DWT->CYCCNT;
+    }
+
+    __real_HAL_ETH_IRQHandler(heth);
+
+    if (g_rx_profile.dwt_enabled)
+    {
+        cycles = DWT->CYCCNT - start;
+    }
+
+    EthernetRtos_ProfileAccumulateVolatile(
+        cycles,
+        &g_rx_profile.eth_irq_calls,
+        &g_rx_profile.eth_irq_cycles_total,
+        &g_rx_profile.eth_irq_cycles_max);
+
+    /*
+     * RBU 优先：若同一次 IRQ 同时带 RI + RBU，则记入 RBU 类，避免重复计数。
+     */
+    if (has_rbu)
+    {
+        EthernetRtos_ProfileAccumulateVolatile(
+            cycles,
+            &g_rx_profile.eth_irq_rbu_calls,
+            &g_rx_profile.eth_irq_rbu_cycles_total,
+            &g_rx_profile.eth_irq_rbu_cycles_max);
+    }
+    else if (has_ri)
+    {
+        EthernetRtos_ProfileAccumulateVolatile(
+            cycles,
+            &g_rx_profile.eth_irq_ri_only_calls,
+            &g_rx_profile.eth_irq_ri_only_cycles_total,
+            &g_rx_profile.eth_irq_ri_only_cycles_max);
+    }
+    else
+    {
+        EthernetRtos_ProfileAccumulateVolatile(
+            cycles,
+            &g_rx_profile.eth_irq_other_calls,
+            &g_rx_profile.eth_irq_other_cycles_total,
+            &g_rx_profile.eth_irq_other_cycles_max);
+    }
+}
 #endif
 
 /**
@@ -329,7 +494,8 @@ static void EthernetRtos_OnRxEvent(void *context)
 #if ETHERNET_RX_PROFILE_ENABLE
     /*
      * Driver 每次从 HAL RX complete callback 转发事件时递增一次。
-     * 该字段可近似看作 RX complete IRQ 数，用于判断是否存在逐包中断。
+     * 该字段可近似看作 RX complete callback 数；实际 HAL IRQ 入口数由
+     * PROFIRQ.total 单独统计。
      */
     g_rx_profile.rx_irq_events++;
 #endif
