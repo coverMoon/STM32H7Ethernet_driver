@@ -10,8 +10,6 @@
 
 #define ETHERNET_EVENT_FLAGS (ETHERNET_RX_EVENT_FLAG | ETHERNET_TX_EVENT_FLAG)
 
-static uint8_t g_rx_frame[ETHERNET_FRAME_BUFFER_SIZE];
-
 static osThreadId_t g_runtime_task_handle;
 static volatile bool g_ready;
 
@@ -56,15 +54,19 @@ static void EthernetRtos_OnTxEvent(void *context)
  * @brief  处理当前所有可读取的 RX Frame。
  *
  * @details
- * 持续读取 Driver 中的完整 Frame，并在任务上下文依次转交给上层处理函数，
- * 直到当前无待处理 Frame 或读取失败。
+ * 直接取得 Driver CPU 侧 Frame 视图并同步交给上层，避免此前
+ * Driver CPU Frame -> RTOS Adapter Frame 的第二次 memcpy。
+ *
+ * Frame view 只在下一次 Driver RX 读取前有效，因此 Handler 必须在本次
+ * 调用内完成同步消费，不能缓存 frame 指针供其他任务稍后使用。
  */
 static void EthernetRtos_ProcessRxFrames(void)
 {
     for (;;)
     {
+        const uint8_t *frame = NULL;
         uint16_t frame_length = 0U;
-        EthernetRxResult result = EthernetDriver_Receive(g_rx_frame, sizeof(g_rx_frame), &frame_length);
+        EthernetRxResult result = EthernetDriver_ReceiveView(&frame, &frame_length);
 
         if ((result == ETHERNET_RX_NONE) || (result == ETHERNET_RX_ERROR))
         {
@@ -73,7 +75,7 @@ static void EthernetRtos_ProcessRxFrames(void)
 
         if (g_rx_frame_handler != NULL)
         {
-            g_rx_frame_handler(g_rx_frame, frame_length, g_rx_frame_handler_context);
+            g_rx_frame_handler(frame, frame_length, g_rx_frame_handler_context);
         }
     }
 }

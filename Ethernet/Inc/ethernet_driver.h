@@ -40,7 +40,7 @@ typedef enum
 typedef struct
 {
     uint32_t rx_frames;               /**< 成功向上层交付的完整 RX Frame 数量。 */
-    uint32_t rx_errors;               /**< EthernetDriver_Receive() 返回错误的次数。 */
+    uint32_t rx_errors;               /**< RX 读取接口返回 ETHERNET_RX_ERROR 的次数。 */
     uint32_t rx_dropped;              /**< Driver 组装阶段明确丢弃的 RX Frame 数量。 */
     uint32_t rx_buffer_unavailable;   /**< RX Descriptor 无法获得空闲 DMA Buffer 的次数。 */
 
@@ -100,7 +100,36 @@ bool EthernetDriver_ConfigureLink(EthernetLinkSpeed speed, EthernetDuplexMode du
 bool EthernetDriver_Start(void);
 EthernetTxResult EthernetDriver_TransmitAsync(const uint8_t *frame, uint16_t length);
 void EthernetDriver_ProcessTxCompletions(void);
+
+/**
+ * @brief 获取 Driver CPU 侧 RX Frame 的只读视图。
+ *
+ * @details
+ * DMA Buffer 已在 HAL_ETH_RxLinkCallback() 中复制到 Driver CPU 暂存区；
+ * 本接口直接返回该暂存区地址，不再执行 Driver -> caller 的第二次 memcpy。
+ * 这仍然是 copy-based RX，不是 DMA zero-copy。
+ *
+ * 返回的 frame 只在下一次 EthernetDriver_ReceiveView() 或
+ * EthernetDriver_Receive() 调用前有效，调用者不得长期持有该指针。
+ *
+ * @param[out] frame   完整 RX Frame 的只读地址。
+ * @param[out] length  Frame 长度。
+ *
+ * @retval ETHERNET_RX_FRAME  成功取得一个完整 Frame。
+ * @retval ETHERNET_RX_NONE   当前没有完整 Frame。
+ * @retval ETHERNET_RX_ERROR  参数、Driver 状态或 RX Frame 无效。
+ */
+EthernetRxResult EthernetDriver_ReceiveView(const uint8_t **frame, uint16_t *length);
+
+/**
+ * @brief 将完整 RX Frame 复制到调用者 Buffer。
+ *
+ * @details
+ * 保留该接口用于需要独立 Frame 副本的调用者。高频同步消费场景优先使用
+ * EthernetDriver_ReceiveView()，避免额外一次 memcpy。
+ */
 EthernetRxResult EthernetDriver_Receive(uint8_t *frame, uint16_t capacity, uint16_t *length);
+
 bool EthernetDriver_GetStats(EthernetDriverStats *stats);
 
 #ifdef __cplusplus

@@ -14,8 +14,9 @@
 /**
  * @brief CPU 侧单帧接收暂存区。
  *
- * DMA RX Buffer 中的数据在 HAL_ETH_RxLinkCallback() 中复制到这里，
- * 因此上层不会持有 DMA Buffer。
+ * DMA RX Buffer 中的数据在 HAL_ETH_RxLinkCallback() 中复制到这里。
+ * RTOS 高频路径通过 EthernetDriver_ReceiveView() 直接读取该区域，
+ * 因此不再需要额外的 Driver -> RTOS Frame memcpy。
  */
 typedef struct
 {
@@ -217,6 +218,63 @@ static bool EthernetDriver_AppendRxData(const uint8_t *buffer, uint16_t length)
     g_rx_frame.length += length;
 
     return true;
+}
+
+/**
+ * @brief 从 HAL 取出一个完整 RX Frame，并返回 Driver 暂存区视图。
+ *
+ * @details
+ * HAL_ETH_ReadData() 会通过 HAL_ETH_RxLinkCallback() 将 DMA Buffer 内容
+ * 组装到 g_rx_frame。这里仅返回 g_rx_frame.data 的地址，不做第二次复制。
+ *
+ * 本函数不更新 rx_frames / rx_errors，由公开 API 根据最终交付结果统一统计。
+ * 返回的 view 在下一次 RX 读取尝试前有效。
+ */
+static EthernetRxResult EthernetDriver_TakeRxFrameView(const uint8_t **frame, uint16_t *length)
+{
+    ETH_HandleTypeDef *eth_handle = EthernetPort_GetHandle();
+    void *app_buffer = NULL;
+    HAL_StatusTypeDef hal_status;
+
+    if ((eth_handle == NULL) ||
+        (frame == NULL) ||
+        (length == NULL) ||
+        (eth_handle->gState != HAL_ETH_STATE_STARTED))
+    {
+        return ETHERNET_RX_ERROR;
+    }
+
+    *frame = NULL;
+    *length = 0U;
+
+    hal_status = HAL_ETH_ReadData(eth_handle, &app_buffer);
+
+    if (hal_status != HAL_OK)
+    {
+        return ETHERNET_RX_NONE;
+    }
+
+    if ((app_buffer != &g_rx_frame) ||
+        !g_rx_frame.valid ||
+        (g_rx_frame.length == 0U) ||
+        (g_rx_frame.length > sizeof(g_rx_frame.data)))
+    {
+        g_rx_frame.length = 0U;
+        g_rx_frame.valid = false;
+        return ETHERNET_RX_ERROR;
+    }
+
+    *frame = g_rx_frame.data;
+    *length = (uint16_t)g_rx_frame.length;
+
+    /*
+     * 只清理组装状态，不擦除 data。
+     * 调用者可以在下一次 RX 读取前同步消费刚返回的只读 view。
+     */
+    g_rx_frame.length = 0U;
+    g_rx_frame.valid = false;
+
+    return ETHERNET_RX_FRAME;
 }
 
 /**
@@ -505,7 +563,42 @@ void EthernetDriver_ProcessTxCompletions(void)
 }
 
 /**
- * @brief  读取一个完整 Ethernet Frame。
+ * @brief  获取一个完整 RX Frame 的 Driver 内部只读视图。
+ *
+ * @details
+ * 该路径用于同步、高频消费场景。Frame 已从 DMA Buffer copy 到 g_rx_frame，
+ * 本函数本身不再执行第二次 memcpy。
+ */
+EthernetRxResult EthernetDriver_ReceiveView(const uint8_t **frame, uint16_t *length)
+{
+    EthernetRxResult result;
+
+    if ((frame == NULL) || (length == NULL))
+    {
+        EthernetDriver_IncrementCounter(&g_stats.rx_errors);
+        return ETHERNET_RX_ERROR;
+    }
+
+    result = EthernetDriver_TakeRxFrameView(frame, length);
+
+    if (result == ETHERNET_RX_FRAME)
+    {
+        EthernetDriver_IncrementCounter(&g_stats.rx_frames);
+    }
+    else if (result == ETHERNET_RX_ERROR)
+    {
+        EthernetDriver_IncrementCounter(&g_stats.rx_errors);
+    }
+
+    return result;
+}
+
+/**
+ * @brief  读取一个完整 Ethernet Frame，并复制到调用者 Buffer。
+ *
+ * @details
+ * 兼容需要独立 Frame 副本的调用者。内部先取得 Driver CPU 暂存区 view，
+ * 再执行一次 memcpy；RTOS 高频路径不使用本接口。
  *
  * @param[out] frame     接收 Frame 的调用者 Buffer。
  * @param[in]  capacity  调用者 Buffer 容量。
@@ -513,52 +606,38 @@ void EthernetDriver_ProcessTxCompletions(void)
  *
  * @retval ETHERNET_RX_FRAME  成功读取一个完整 Frame。
  * @retval ETHERNET_RX_NONE   当前没有完整 Frame。
- * @retval ETHERNET_RX_ERROR  Port、参数、状态或 RX Frame 无效。
+ * @retval ETHERNET_RX_ERROR  Port、参数、状态、容量或 RX Frame 无效。
  */
 EthernetRxResult EthernetDriver_Receive(uint8_t *frame, uint16_t capacity, uint16_t *length)
 {
-    ETH_HandleTypeDef *eth_handle = EthernetPort_GetHandle();
-    void *app_buffer = NULL;
-    HAL_StatusTypeDef hal_status;
+    const uint8_t *driver_frame = NULL;
+    uint16_t driver_length = 0U;
+    EthernetRxResult result;
 
-    if ((eth_handle == NULL) ||
-        (frame == NULL) ||
-        (length == NULL) ||
-        (capacity == 0U) ||
-        (eth_handle->gState != HAL_ETH_STATE_STARTED))
+    if ((frame == NULL) || (length == NULL) || (capacity == 0U))
     {
         EthernetDriver_IncrementCounter(&g_stats.rx_errors);
         return ETHERNET_RX_ERROR;
     }
 
     *length = 0U;
+    result = EthernetDriver_TakeRxFrameView(&driver_frame, &driver_length);
 
-    hal_status = HAL_ETH_ReadData(eth_handle, &app_buffer);
-
-    if (hal_status != HAL_OK)
+    if (result == ETHERNET_RX_NONE)
     {
         return ETHERNET_RX_NONE;
     }
 
-    if ((app_buffer != &g_rx_frame) ||
-        !g_rx_frame.valid ||
-        (g_rx_frame.length == 0U) ||
-        (g_rx_frame.length > capacity))
+    if ((result == ETHERNET_RX_ERROR) ||
+        (driver_frame == NULL) ||
+        (driver_length > capacity))
     {
-        g_rx_frame.length = 0U;
-        g_rx_frame.valid = false;
-
         EthernetDriver_IncrementCounter(&g_stats.rx_errors);
-
         return ETHERNET_RX_ERROR;
     }
 
-    memcpy(frame, g_rx_frame.data, g_rx_frame.length);
-
-    *length = (uint16_t)g_rx_frame.length;
-
-    g_rx_frame.length = 0U;
-    g_rx_frame.valid = false;
+    memcpy(frame, driver_frame, driver_length);
+    *length = driver_length;
 
     EthernetDriver_IncrementCounter(&g_stats.rx_frames);
 
@@ -604,6 +683,7 @@ void HAL_ETH_RxAllocateCallback(uint8_t **buffer)
  * @details
  * HAL_ETH_ReadData() 每处理一个 RX Descriptor 都会调用本函数。
  * DMA Buffer 完成复制后立即归还 RX Pool，使 Descriptor 可以重新获取 Buffer。
+ * 该 memcpy 是当前 RX 热路径保留的唯一数据复制；RTOS Adapter 不再复制 Frame。
  */
 void HAL_ETH_RxLinkCallback(void **pStart, void **pEnd, uint8_t *buffer, uint16_t length)
 {
