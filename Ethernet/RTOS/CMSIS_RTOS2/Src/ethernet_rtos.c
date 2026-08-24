@@ -10,6 +10,8 @@
 
 #define ETHERNET_EVENT_FLAGS (ETHERNET_RX_EVENT_FLAG | ETHERNET_TX_EVENT_FLAG)
 
+static uint8_t g_rx_frame[ETHERNET_FRAME_BUFFER_SIZE];
+
 static osThreadId_t g_runtime_task_handle;
 static volatile bool g_ready;
 
@@ -54,28 +56,29 @@ static void EthernetRtos_OnTxEvent(void *context)
  * @brief  处理当前所有可读取的 RX Frame。
  *
  * @details
- * 直接取得 Driver CPU 侧 Frame 视图并同步交给上层，避免此前
- * Driver CPU Frame -> RTOS Adapter Frame 的第二次 memcpy。
+ * RX complete ISR 只负责第一次唤醒，并在通知 Runtime Task 前临时屏蔽
+ * RX complete interrupt。本函数随后持续 drain Driver 中的完整 Frame，
+ * 避免高包率下每个 Frame 都重复经历 IRQ -> Task wakeup。
  *
- * Frame view 只在下一次 Driver RX 读取前有效，因此 Handler 必须在本次
- * 调用内完成同步消费，不能缓存 frame 指针供其他任务稍后使用。
+ * drain 到当前无完整 Frame或发生读取错误后，重新使能 RX complete
+ * interrupt，回到等待下一批 Frame 的状态。
  */
 static void EthernetRtos_ProcessRxFrames(void)
 {
     for (;;)
     {
-        const uint8_t *frame = NULL;
         uint16_t frame_length = 0U;
-        EthernetRxResult result = EthernetDriver_ReceiveView(&frame, &frame_length);
+        EthernetRxResult result = EthernetDriver_Receive(g_rx_frame, sizeof(g_rx_frame), &frame_length);
 
         if ((result == ETHERNET_RX_NONE) || (result == ETHERNET_RX_ERROR))
         {
+            EthernetDriver_RearmRxInterrupt();
             return;
         }
 
         if (g_rx_frame_handler != NULL)
         {
-            g_rx_frame_handler(frame, frame_length, g_rx_frame_handler_context);
+            g_rx_frame_handler(g_rx_frame, frame_length, g_rx_frame_handler_context);
         }
     }
 }
