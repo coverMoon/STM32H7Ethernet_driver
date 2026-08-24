@@ -101,7 +101,6 @@ bool EthernetDriver_Start(void);
 EthernetTxResult EthernetDriver_TransmitAsync(const uint8_t *frame, uint16_t length);
 void EthernetDriver_ProcessTxCompletions(void);
 EthernetRxResult EthernetDriver_Receive(uint8_t *frame, uint16_t capacity, uint16_t *length);
-void EthernetDriver_RearmRxInterrupt(void);
 bool EthernetDriver_GetStats(EthernetDriverStats *stats);
 
 #ifdef __cplusplus

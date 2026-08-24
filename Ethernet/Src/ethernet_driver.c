@@ -117,48 +117,6 @@ static void EthernetDriver_InvalidateRxFrame(void)
 }
 
 /**
- * @brief 判断 HAL 当前 RX Descriptor 是否已经交还给 CPU。
- *
- * @details
- * HAL_ETH_IRQHandler() 在调用 HAL_ETH_RxCpltCallback() 前会清 RI。
- * Runtime Task 完成一轮 drain 后重新打开 RIE 时，之前被屏蔽期间留下的
- * RI 可能立即触发一次“旧中断”。此时通过当前 Descriptor 的 OWN 位判断
- * 是否真的还有新 Frame 等待处理，避免无意义地再次唤醒 Runtime Task。
- *
- * @param[in] eth_handle Ethernet HAL Handle。
- *
- * @retval true   当前 Descriptor 已由 DMA 完成，CPU 可以继续读取。
- * @retval false  当前 Descriptor 仍归 DMA 所有，暂时没有待处理数据。
- */
-static bool EthernetDriver_IsRxDescriptorReady(const ETH_HandleTypeDef *eth_handle)
-{
-    uint32_t desc_index;
-    ETH_DMADescTypeDef *descriptor;
-
-    if (eth_handle == NULL)
-    {
-        return false;
-    }
-
-    desc_index = eth_handle->RxDescList.RxDescIdx;
-
-    if ((desc_index >= ETH_RX_DESC_CNT) || (eth_handle->RxDescList.RxDesc[desc_index] == 0U))
-    {
-        return false;
-    }
-
-    descriptor = (ETH_DMADescTypeDef *)eth_handle->RxDescList.RxDesc[desc_index];
-
-    /*
-     * RX Descriptor 位于 non-cacheable DMA SRAM。DMB 只保证这里的读取
-     * 不越过前面的外设/内存访问，不承担 cache maintenance 职责。
-     */
-    __DMB();
-
-    return READ_BIT(descriptor->DESC3, ETH_DMARXNDESCWBF_OWN) == 0U;
-}
-
-/**
  * @brief  释放一个 RX DMA Buffer。
  *
  * @param[in] buffer RX DMA Buffer 首地址。
@@ -414,13 +372,6 @@ bool EthernetDriver_ConfigureLink(EthernetLinkSpeed speed, EthernetDuplexMode du
 /**
  * @brief  以中断模式启动 Ethernet MAC 和 DMA。
  *
- * @details
- * HAL_ETH_Start_IT() 仍负责建立 IT 模式 RX Descriptor，并保留 TX complete、
- * RX complete、fatal bus error 等 HAL 行为。启动成功后单独屏蔽 RBUE：
- * RX Buffer Unavailable 对当前 copy-first Driver 是可恢复的背压状态，
- * Descriptor 会在 HAL_ETH_ReadData() 中重建，不需要为每次 RBU 再进入
- * Error IRQ / callback 热路径。
- *
  * @retval true   启动成功。
  * @retval false  Port、HAL 状态错误或启动失败。
  */
@@ -433,51 +384,7 @@ bool EthernetDriver_Start(void)
         return false;
     }
 
-    if (HAL_ETH_Start_IT(eth_handle) != HAL_OK)
-    {
-        return false;
-    }
-
-    /*
-     * 仅关闭 RBU source。AIE / FBEE 继续保持 HAL Start_IT() 的配置，
-     * 因而 Fatal Bus Error 等真正的 DMA 异常仍可正常进入 HAL error path。
-     */
-    __HAL_ETH_DMA_DISABLE_IT(eth_handle, ETH_DMACIER_RBUE);
-
-    return true;
-}
-
-/**
- * @brief  重新使能 RX complete 中断。
- *
- * @details
- * HAL_ETH_RxCpltCallback() 在第一次 RX 中断后会关闭 RIE，让 Runtime Task
- * 连续 drain 当前 RX ring。任务处理到暂时无 Frame 后调用本函数恢复 RIE。
- *
- * 被屏蔽期间 RI 状态可能保持置位；重新打开 RIE 后可能立即产生一次 IRQ。
- * HAL callback 会再次检查当前 Descriptor OWN 位，并过滤没有实际待处理
- * Descriptor 的旧 RI，因此这里不主动清 DMACSR，避免和其他 DMA 状态位竞态。
- */
-void EthernetDriver_RearmRxInterrupt(void)
-{
-    ETH_HandleTypeDef *eth_handle = EthernetPort_GetHandle();
-    uint32_t primask;
-
-    if (eth_handle == NULL)
-    {
-        return;
-    }
-
-    primask = EthernetDriver_EnterCritical();
-
-    if (eth_handle->gState == HAL_ETH_STATE_STARTED)
-    {
-        /* Descriptor rebuild / tail pointer update 必须先对 DMA 可见。 */
-        __DMB();
-        __HAL_ETH_DMA_ENABLE_IT(eth_handle, ETH_DMACIER_RIE);
-    }
-
-    EthernetDriver_ExitCritical(primask);
+    return HAL_ETH_Start_IT(eth_handle) == HAL_OK;
 }
 
 /**
@@ -738,42 +645,19 @@ void HAL_ETH_RxLinkCallback(void **pStart, void **pEnd, uint8_t *buffer, uint16_
  * @brief  HAL RX complete callback。
  *
  * @details
- * 第一次 RX complete interrupt 只负责把 Runtime Task 唤醒，并立即屏蔽 RIE。
- * Runtime Task 会在中断保持屏蔽期间批量 drain RX ring，处理完当前积压后再通过
- * EthernetDriver_RearmRxInterrupt() 恢复 RIE。
- *
- * 重新打开 RIE 时，屏蔽期间遗留的 RI 状态可能触发一次旧中断。这里检查 HAL
- * 当前 RxDescIdx 对应 Descriptor 的 OWN 位；若 Descriptor 仍归 DMA 所有，说明
- * 实际没有新 Frame，无需再次唤醒 Runtime Task，直接恢复 RIE 即可。
+ * 仅把中断事件转交给注册的上层事件处理函数，不读取 Frame。
  */
 void HAL_ETH_RxCpltCallback(ETH_HandleTypeDef *heth)
 {
     EthernetDriverRxEventHandler handler = g_rx_event_handler;
     void *context = g_rx_event_context;
 
-    if ((heth == NULL) || (handler == NULL))
+    (void)heth;
+
+    if (handler != NULL)
     {
-        return;
+        handler(context);
     }
-
-    /*
-     * 从这里开始把 RX complete interrupt 当作“启动一轮 RX batch”的门铃。
-     * TX / Error interrupt 保持原状态，不受影响。
-     */
-    __HAL_ETH_DMA_DISABLE_IT(heth, ETH_DMACIER_RIE);
-
-    if (!EthernetDriver_IsRxDescriptorReady(heth))
-    {
-        /*
-         * 这是 rearm 后由旧 RI 造成的空中断。HAL 已在进入 callback 前清 RI，
-         * 因此此处直接重新打开 RIE，不需要碰 DMACSR 其他状态位。
-         */
-        __DMB();
-        __HAL_ETH_DMA_ENABLE_IT(heth, ETH_DMACIER_RIE);
-        return;
-    }
-
-    handler(context);
 }
 
 /**
