@@ -74,9 +74,9 @@ BSP/Port、PHY、MAC/DMA、ethernetif 和 LwIP 接口优先使用 C；上层应�
 
 - 状态：Superseded
 - 日期：2026-08-20
-- 替代：D016
+- 替代：D016，后续再由 D026 更新 Reference Example 基线
 
-原倾向为专用 DMA 区域 + 明确 MPU 属性；已由 STM32H743 实际 SRAM3 / MPU / linker 方案替代。
+原倾向为专用 DMA 区域 + 明确 MPU 属性；后续由 STM32H743 实际 SRAM3 / MPU / linker 方案替代。
 
 ---
 
@@ -136,7 +136,7 @@ ETH ISR 调用 RTOS API 前必须核对实际 FreeRTOSConfig 与 NVIC priority�
 - 日期：2026-08-20
 - 替代：D020、D022
 
-CubeMX/ST 生成内容的基本原则继续保留：`.ioc`、Core、CMSIS、HAL、FreeRTOS generated files、`cmake/stm32cubemx/CMakeLists.txt` 属于生成侧；Core 手工代码只进 USER CODE 区域。旧的根目录 `Drivers/Ethernet/**` 手工维护路径已被 Package 化替代。
+CubeMX/ST 生成内容的基本原则继续保留：`.ioc`、Core、CMSIS、HAL、FreeRTOS generated files、`cmake/stm32cubemx/CMakeLists.txt` 属于生成侧；Core 手工代码只进 USER CODE 区域。通用 Driver 目录与板级绑定由 D020/D022 定义。
 
 ---
 
@@ -156,27 +156,17 @@ LAN8720 PHY Driver 与 FreeRTOS/LwIP 解耦，只通过 MDIO Wrapper 提供 Read
 
 根 README 面向 Driver 使用者，不作为开发日志；项目控制文档可包含 M0/M1/M2、工作单元、Accepted/Proposed 和测试状态。Static Review、Build Verified、On-board Verified、Measured 必须区分。
 
-运行时机制、callback、weak symbol 与 ownership 原理说明独立放在 `docs/ETHERNET_RUNTIME_FLOW.md`，README 只提供入口链接，不复制整篇原理说明。
+运行时机制、callback、weak symbol 与 ownership 原理说明独立放在 `docs/ETHERNET_RUNTIME_FLOW.md`。README 可以保留对用户有直接价值的 Reference Example 性能基线，但不复制完整诊断过程。
 
 ---
 
-## D016 STM32H743 Ethernet DMA 内存与 MPU
+## D016 STM32H743 Ethernet DMA 内存与 MPU（旧基线）
 
-- 状态：Accepted
+- 状态：Superseded
 - 日期：2026-08-21
+- 替代：D026
 
-当前 STM32H743 参考板：
-
-```text
-RAM_ETH = SRAM3 = 0x30040000 / 32 KiB
-RAM_D2  = 0x30000000 / 256 KiB
-RX Desc = 0x30040000
-TX Desc = 0x30040080
-ETH_RX_DESC_CNT = 4
-ETH_TX_DESC_CNT = 4
-```
-
-HAL Descriptor 24 B，4 个实际 96 B，每组预留 128 B。MPU：SRAM3 Normal Non-cacheable；前 256 B Device overlay。当前 I/D Cache Disabled。板级代码在 MX_ETH_Init 前使能 D2 SRAM3 时钟。
+历史基线为 RX4/TX4、TX Descriptor `0x30040080`、RX/TX Pool 各 4×1536 B、I/D Cache Disabled。该配置已被后续 RX8 + I-Cache Enabled 的 Reference Example 基线替代。
 
 ---
 
@@ -187,7 +177,7 @@ HAL Descriptor 24 B，4 个实际 96 B，每组预留 128 B。MPU：SRAM3 Normal
 
 板级 linker 显式管理 Ethernet DMA 内存和 section，不使用 regex/string patch 自动修改 linker。自动化优先用于 map/ELF、alignment、越界、section 非空等验证。
 
-第二阶段仓库整理后，当前参考 linker 位于：
+当前参考 linker：
 
 ```text
 examples/STM32H743_LAN8720_FreeRTOS/STM32H743xx_FLASH.ld
@@ -200,33 +190,18 @@ examples/STM32H743_LAN8720_FreeRTOS/STM32H743xx_FLASH.ld
 - 状态：Accepted
 - 日期：2026-08-21
 
-不使用 CubeMX Memory Management Tool 自动管理 Ethernet DMA linker section。`.ioc` 保存 Descriptor 地址与 MPU；Example linker 保存物理 DMA SRAM/section；Port 处理板级 SRAM 准备。
+不使用 CubeMX Memory Management Tool 自动管理 Ethernet DMA linker section。`.ioc` 保存 Descriptor 地址、count、MPU/Cache 配置；Example linker 保存物理 DMA SRAM/section；Port 处理板级 SRAM 准备。
 
 ---
 
-## D019 第一版 Payload Buffer 与 ownership
+## D019 第一版 Payload Buffer 与 ownership（旧内存基线）
 
-- 状态：Accepted
+- 状态：Superseded
 - 日期：2026-08-21
 - TX ownership 子项替代：D025
+- Buffer Count / layout / RX 基线替代：D026
 
-```text
-RX Buffer Count = 4
-TX Buffer Count = 4
-Buffer Size     = 1536 B
-Alignment       = 32 B
-```
-
-Driver input section：`.eth_dma_buffer.rx` / `.eth_dma_buffer.tx`。当前参考板：
-
-```text
-RX Pool = 0x30042000 / 0x1800
-TX Pool = 0x30044000 / 0x1800
-```
-
-RX：DMA Buffer → HAL Link callback → copy CPU frame → 立即归还 pool。
-
-本决定建立时 TX 仍为 polling：caller → copy TX DMA Buffer → `HAL_ETH_Transmit(timeout)` → HAL_OK 后归还。该 TX polling ownership 已由 D025 的 async TX completion ownership 替代；Buffer Count / Size / Alignment、RX ownership 与 section 约束继续有效。
+历史配置为 RX4/TX4、RX Pool `0x30042000 / 0x1800`、TX Pool `0x30044000 / 0x1800`。RX 采用 DMA Buffer → HAL Link callback → copy CPU frame → 立即归还 pool；该 copy-first 语义继续保留，但当前 count / 地址由 D026 更新。TX polling ownership 已由 D025 的 async TX completion ownership 替代。
 
 ---
 
@@ -259,7 +234,7 @@ HAL Handle、PHY Reset、DMA SRAM clock 属于目标工程；物理 DMA 地址�
 
 Driver Core 与 FreeRTOS/CMSIS-RTOS2 解耦。可选 `Ethernet/RTOS/CMSIS_RTOS2` Adapter 不创建 Task；Application/CubeMX 决定 Task priority、stack、allocation。
 
-本决定建立时入口为 `EthernetRtos_RxTask()`，RX 路径为：
+RX 路径：
 
 ```text
 HAL_ETH_RxCpltCallback()
@@ -271,8 +246,6 @@ HAL_ETH_RxCpltCallback()
 ```
 
 完整 Frame 在任务上下文通过同步 Handler 交付；Frame pointer 只在 Handler 调用期间有效。`0x88B5` 测试逻辑属于 Example。
-
-D024 将 Task 名称和职责扩展为 RX/TX 共用的 `EthernetRtos_RuntimeTask()`，但不改变本决定的 RX Frame 交付边界。
 
 ---
 
@@ -296,9 +269,7 @@ STM32H743VIT6 + LAN8720AI + FreeRTOS 完整 CubeMX 工程统一位于：
 examples/STM32H743_LAN8720_FreeRTOS/
 ```
 
-其中 Core、ST Drivers、FreeRTOS、`.ioc`、linker、CMake、build/flash 脚本都属于 Reference Example，不是 Driver 固定依赖。
-
-`docs/stm32h7_ethernet_project_docs/00_PROJECT.md` ～ `08_HANDOFF.md` 路径暂时保持稳定，避免破坏项目状态读取约定。原 `docs/BOARD_PORTING.md` 的用户迁移职责合并到根 README，删除重复维护源。
+Core、ST Drivers、FreeRTOS、`.ioc`、linker、CMake、build/flash 脚本都属于 Reference Example，不是 Driver 固定依赖。
 
 ---
 
@@ -308,18 +279,7 @@ examples/STM32H743_LAN8720_FreeRTOS/
 - 日期：2026-08-22
 - 替代：D024
 
-当时 Reference Example 使用：
-
-```text
-Task Entry : EthernetRtos_RxTask
-Generation : As weak
-```
-
-CubeMX 6.18.1 已确认：CubeMX 继续生成 Task attributes、priority、stack、allocation 和 `osThreadNew()`；generated `freertos.c` 生成 weak stub；Package 提供同名强定义。
-
-该方案已经完成 Generate Code、Debug/Release Build、map/ELF 检查和 On-board async RX 1000 / 1000 回归。
-
-后续由于同一任务同时承担 TX completion reclaim，D024 将 Task 名称和 Entry 更新为 `EthernetRuntime / EthernetRtos_RuntimeTask`，继续沿用 `As weak + Package strong implementation` 的构建边界。
+历史方案使用 `EthernetRtos_RxTask / As weak`。后续由于同一任务承担 TX completion reclaim，D024 将 Task 名称和 Entry 更新为 `EthernetRuntime / EthernetRtos_RuntimeTask`，继续沿用 `As weak + Package strong implementation` 的构建边界。
 
 ---
 
@@ -337,39 +297,9 @@ Task Entry : EthernetRtos_RuntimeTask
 Generation : As weak
 ```
 
-CubeMX 负责：
+CubeMX 负责 Task object、priority、stack、allocation、`osThreadNew()` 和 weak Task stub；Package 负责强定义 Runtime Task、RX/TX event registration、Thread Flag wait、RX drain 和 TX completion reclaim。
 
-```text
-Task object
-priority
-stack
-allocation
-osThreadNew()
-weak Task stub
-```
-
-Package 负责：
-
-```text
-EthernetRtos_RuntimeTask() strong implementation
-runtime task handle
-RX complete event registration
-TX complete event registration
-RX/TX Thread Flag wait
-RX drain
-TX completion reclaim
-```
-
-Runtime Task 启动时自动注册：
-
-```text
-EthernetDriver_SetRxEventHandler(EthernetRtos_OnRxEvent)
-EthernetDriver_SetTxEventHandler(EthernetRtos_OnTxEvent)
-```
-
-`EthernetRtos_IsReady()` 只有在两类 ISR event 都完成绑定后才为 true。
-
-RX/TX 共用一个 Runtime Task；同一次唤醒同时含 RX/TX flag 时，当前先处理 TX completion，再 drain RX。该方案已完成 CubeMX Generate Code、Build、async TX 上板测试以及 RuntimeTask 改名后的 async RX 1000 / 1000 回归。
+同一次唤醒同时含 RX/TX flag 时，当前先处理 TX completion，再 drain RX。该方案已完成 CubeMX Generate Code、Build、async TX 上板测试以及 async RX 回归。
 
 ---
 
@@ -398,12 +328,50 @@ Caller Frame
 
 规则：
 
-- `EthernetDriver_TransmitAsync()` 返回 `ETHERNET_TX_QUEUED` 后 caller 原始 Frame 可立即复用；
-- 当前不向 Application 暴露 per-frame TX completion callback；completion 主要用于 Driver 内部 Buffer recycle；
-- `ETHERNET_TX_RETRY` 表示临时没有 TX Buffer / Descriptor 等可用资源，Driver 不隐藏软件 TX Queue；
-- `tx_config.pData` 保存 Driver TX DMA Buffer 地址，HAL 通过 `PacketAddress[]` 在 `HAL_ETH_ReleaseTxPacket()` 时把该地址传给 `HAL_ETH_TxFreeCallback()`；
+- 返回 `ETHERNET_TX_QUEUED` 后 caller 原始 Frame 可立即复用；
+- 当前不向 Application 暴露 per-frame TX completion callback；
+- `ETHERNET_TX_RETRY` 表示临时没有 TX Buffer / Descriptor 等资源，Driver 不隐藏软件 TX Queue；
 - TX complete ISR 只做 event forwarding，不在 ISR 中 reclaim Descriptor / Buffer；
-- `EthernetDriver_TransmitAsync()` 在正式 submit 前执行一次 completion reclaim backstop；
-- `HAL_ETH_Transmit_IT()` 与 `HAL_ETH_ReleaseTxPacket()` 及 TX Pool acquire/release 用短 PRIMASK critical section 序列化，避免并发修改 HAL/Driver TX bookkeeping；Frame memcpy 不放在整个关中断区。
+- submit 前执行一次 completion reclaim backstop；
+- HAL TX submit/reclaim 与 TX Pool ownership 用短 PRIMASK critical section 序列化，Frame memcpy 不放在整个关中断区。
 
-该方案已完成连续 1000-frame async TX 上板测试，并在同一 RuntimeTask 结构下重新完成 async RX 1000 / 1000 回归。
+该方案已完成连续 1000-frame async TX 上板测试和 RX 回归。该测试只证明 ownership/completion recycle，不代表 TX throughput 性能基线。
+
+---
+
+## D026 STM32H743 Reference Example DMA / Cache 基线 v2
+
+- 状态：Accepted
+- 日期：2026-08-24
+- 替代：D016；D019 中 Buffer Count / layout / RX 内存基线
+
+当前 Reference Example 冻结为：
+
+```text
+RAM_ETH = SRAM3 = 0x30040000 / 32 KiB
+RAM_D2  = 0x30000000 / 256 KiB
+
+ETH_RX_DESC_CNT = 8
+ETH_TX_DESC_CNT = 4
+RX Desc = 0x30040000 / 8 × 24 B / linker slot 0x100
+TX Desc = 0x30040100 / 4 × 24 B / linker slot 0x100
+
+RX Pool = 0x30042000 / 0x3000 / 8 × 1536 B
+TX Pool = 0x30045000 / 0x1800 / 4 × 1536 B
+Alignment = 32 B
+```
+
+MPU / Cache：
+
+```text
+SRAM3 whole region : Normal Non-cacheable / Shareable
+0x30040000~0x300401FF : 512 B Device overlay for descriptors
+I-Cache : Enabled
+D-Cache : Disabled
+```
+
+RX ownership 继续使用 copy-first：DMA Buffer → Driver CPU frame → RTOS Adapter Frame。TX ownership 继续遵守 D025。
+
+I-Cache Enabled 已完成单变量和 clean stress 实测：60 B RX clean saturation 从历史约 `71.1 kpps` 提升到约 `130.6 kpps`；1514 B @ 8000 pps、200000 帧零丢包，估算 on-wire 约 `98.43 Mbit/s`。因此 I-Cache Enabled 是当前 Reference Example 的正式基线配置。
+
+D-Cache-on 仍未验证；不得把当前 Non-cacheable SRAM3 方案等同于未来 Cacheable DMA Buffer 方案。

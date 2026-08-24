@@ -1,8 +1,8 @@
 # Project Status
 
-- 更新时间：2026-08-23
+- 更新时间：2026-08-24
 - 当前阶段：M2 — MAC / DMA Runtime
-- 当前状态：copy-based async RX / async TX、统一 `EthernetRtos_RuntimeTask()`、Driver Package 与 Reference Example 均已完成基础 Build / Map / On-board 回归。D024 / D025 已 Accepted。
+- 当前状态：RX 性能瓶颈定位已完成并收口；Reference Example 已启用 I-Cache，清理全部临时 profiler，并完成 60 B 小包与 1514 B 大包 RX clean baseline。TX async ownership 已验证，但 TX throughput 尚未建立 Measured 基线。
 
 ## 1. 已确认完成
 
@@ -13,17 +13,29 @@
 - [x] Auto-negotiation、Link、100M Full Duplex；
 - [x] USART1 调试输出。
 
-### DMA / Memory
+### DMA / Memory / Cache
 
-- [x] RAM_ETH = SRAM3 `0x30040000 / 32 KiB`；
-- [x] RX Desc `0x30040000`；
-- [x] TX Desc `0x30040080`；
-- [x] RX Pool `0x30042000 / 0x1800 / 4×1536 B`；
-- [x] TX Pool `0x30044000 / 0x1800 / 4×1536 B`；
-- [x] MPU Non-cacheable + Descriptor Device overlay；
-- [x] linker ASSERT / map 验证；
-- [x] copy-based RX recycle；
-- [x] copy-based async TX completion recycle。
+当前 Reference Example：
+
+```text
+RAM_ETH = SRAM3 = 0x30040000 / 32 KiB
+RAM_D2  = 0x30000000 / 256 KiB
+
+RX Desc = 0x30040000 / 8 × 24 B
+TX Desc = 0x30040100 / 4 × 24 B
+RX Pool = 0x30042000 / 0x3000 / 8 × 1536 B
+TX Pool = 0x30045000 / 0x1800 / 4 × 1536 B
+
+MPU     = SRAM3 Normal Non-cacheable + first 512 B Device overlay
+I-Cache = Enabled
+D-Cache = Disabled
+```
+
+- [x] linker / map / ELF layout；
+- [x] RX copy-based ownership / recycle；
+- [x] TX copy-based async ownership / completion recycle；
+- [x] I-Cache Enabled 上板验证；
+- [ ] D-Cache-on。
 
 ### MAC / DMA Runtime
 
@@ -32,8 +44,7 @@
 - [x] Raw TX / RX；
 - [x] polling RX 1000 / 1000；
 - [x] ETH IRQ；
-- [x] Driver generic RX event；
-- [x] Driver generic TX event；
+- [x] Driver generic RX/TX event；
 - [x] CMSIS-RTOS2 RX/TX Thread Flag；
 - [x] `EthernetRtos_RuntimeTask()`；
 - [x] RX drain 到 `ETHERNET_RX_NONE`；
@@ -42,14 +53,14 @@
 - [x] task-side `HAL_ETH_ReleaseTxPacket()`；
 - [x] `HAL_ETH_TxFreeCallback()` TX Buffer recycle；
 - [x] async TX 1000-frame test；
-- [x] RuntimeTask 改名 / TX completion 加入后的 async RX 1000 / 1000 回归。
+- [x] `EthernetDriver_GetStats()` 与 RX/TX/HAL/DMA/MAC 统计快照。
 
 ### Driver Package / Reference Example
 
 ```text
 Ethernet/                                  ← Driver Package
 examples/STM32H743_LAN8720_FreeRTOS/       ← Reference Example
-README.md                                  ← Integration Guide
+README.md                                  ← Integration Guide + RX baseline
 docs/ETHERNET_RUNTIME_FLOW.md              ← RX/TX Runtime 原理说明
 ```
 
@@ -59,29 +70,8 @@ docs/ETHERNET_RUNTIME_FLOW.md              ← RX/TX Runtime 原理说明
 - [x] Adapter 不创建 Task；
 - [x] Frame Handler 保持任务上下文；
 - [x] `0x88B5` 测试逻辑留在 Example；
-- [x] 完整 Demo 位于 `examples/`；
 - [x] Example CMake 通过 `../../Ethernet` 引用 Package；
-- [x] Debug / Release Build 回归；
-- [x] map / ELF 地址回归；
-- [x] async RX / TX 上板回归。
-
-### CubeMX Runtime Task 边界
-
-当前已采用并验证：
-
-```text
-Task Name  : EthernetRuntime
-Task Entry : EthernetRtos_RuntimeTask
-Generation : As weak
-```
-
-- [x] CubeMX 6.18.1 Generate Code；
-- [x] generated `freertos.c` 产生 weak Task Entry；
-- [x] CubeMX 继续管理 Task attributes / `osThreadNew()`；
-- [x] Package 同名强定义链接无冲突；
-- [x] Runtime Task 同时处理 RX deferred processing 与 TX completion reclaim；
-- [x] Build / On-board RX/TX 回归通过；
-- [x] D024 Accepted。
+- [x] Debug / Release Build、map / ELF、On-board RX/TX 回归。
 
 ## 2. 当前接口
 
@@ -105,6 +95,7 @@ EthernetDriver_Start()
 EthernetDriver_TransmitAsync()
 EthernetDriver_ProcessTxCompletions()
 EthernetDriver_Receive()
+EthernetDriver_GetStats()
 EthernetMdio_Read()/Write()
 Lan8720_IsReady()
 Lan8720_RestartAutoNegotiation()
@@ -117,21 +108,6 @@ CMSIS-RTOS2：
 EthernetRtos_SetRxFrameHandler()
 EthernetRtos_IsReady()
 EthernetRtos_RuntimeTask()
-```
-
-其中：
-
-```text
-EthernetDriver_SetRxEventHandler()
-EthernetDriver_SetTxEventHandler()
-→ Driver → RTOS Adapter 内部绑定
-→ 由 RuntimeTask 启动时自动完成
-
-EthernetRtos_SetRxFrameHandler()
-→ RTOS Adapter → Application / ethernetif
-
-EthernetDriver_TransmitAsync()
-→ Application / ethernetif → Driver TX
 ```
 
 ## 3. 当前 RX Runtime
@@ -151,7 +127,7 @@ ETH IRQ
 → Frame Handler
 ```
 
-当前 RX 1000 / 1000 回归通过。
+当前保持 copy-first 两次 copy，不使用临时 ReceiveView/zero-copy 实验代码。
 
 ## 4. 当前 TX Runtime
 
@@ -173,26 +149,78 @@ Caller Frame
 → TX Buffer recycle
 ```
 
-当前 async TX 1000-frame test 已通过。
-
 Driver 当前没有软件 TX Queue；临时资源不足返回 `ETHERNET_TX_RETRY`。TX submit 与 reclaim 用短 critical section 序列化。
 
-## 5. Runtime 原理文档
+## 5. RX 性能定位结论
 
-`docs/ETHERNET_RUNTIME_FLOW.md` 已扩展为 RX/TX 双向说明，覆盖：
+本轮通过 DWT / linker-wrap 仅做临时诊断，最终代码已全部清理 profiler，恢复 clean Runtime。
 
-- CubeMX weak Task Entry 与 Package strong implementation；
-- HAL 固定 callback；
-- RX/TX Driver event Handler；
-- Thread Flag 的事件位语义；
-- RX drain 与两次 copy；
-- TX async submit / backpressure；
-- HAL `pData → PacketAddress[] → TxFreeCallback()`；
-- task-side TX completion reclaim；
-- TX critical section；
-- RX/TX 共用 Runtime Task 的理由和处理顺序。
+历史主要结果：
 
-## 6. 当前测试等级
+```text
+I-Cache Disabled, clean 60 B saturation ≈ 71.1 kpps
+I-Cache Enabled, clean 60 B saturation  ≈ 130.6 kpps
+```
+
+I-Cache 开启后的 hot-path profiler 曾显示 `HAL_ETH_ReadData()` 与 `HAL_ETH_IRQHandler()` 耗时均显著下降；clean stress 再次独立确认吞吐提升。因此此前异常低的小包 RX 性能主要由 I-Cache Disabled 导致。
+
+诊断实验：
+
+- ReceiveView / one-copy：Rejected，未提升吞吐；
+- software RX interrupt batching：Rejected，吞吐下降；
+- RBUE-only disable：Rejected，吞吐明显下降；
+- I-Cache Enabled：Validated，并成为 D026 当前基线。
+
+## 6. RX clean performance baseline — Measured
+
+测试脚本：`test/send_eth_stress.py`。测试固件基于 clean Runtime、I-Cache Enabled、D-Cache Disabled、RX8/TX4。
+
+### 60 B
+
+| 输入 | 数量 | 接收 | HAL/RBU events |
+| --- | ---: | ---: | ---: |
+| 80 kpps | 200000 | 200000 | 0 |
+| 90 kpps | 200000 | 200000 | 0 |
+| 100 kpps | 200000 | 200000 | 0 |
+| 110 kpps | 200000 | 200000 | 0 |
+| 120 kpps | 200000 | 200000 | 99 |
+| 120 kpps | 1000000 | 1000000 | 205 |
+| 130 kpps | 200000 | 200000 | 52777 |
+| 140 kpps | 200000 | 186539 | 186457 |
+| 148.59 kpps | 200000 | 175866 | 175686 |
+
+两组过载测试对应实际接收平台均约 `130.6 kpps`。100BASE-TX 最小帧理论极限约 `148.8 kpps`，当前约为理论 packet-rate 的 `87.8%`。
+
+`120 kpps × 1,000,000`：8.333 s，100% received，205 HAL/RBU events，`err/drop/no_buf = 0`。可作为当前扩展高负载工作点，但不等价于长时间 Stress。
+
+### 1514 B
+
+```text
+8000 pps × 200000
+Elapsed = 25.000 s
+RX      = 200000 / 200000
+HAL/DMA = 0
+script frame rate = 96.90 Mbit/s
+estimated on-wire ≈ 98.43 Mbit/s
+```
+
+该结果足以确认 RX 大帧接近 100M 线速。
+
+## 7. TX 性能状态
+
+当前只完成：
+
+```text
+async TX 1000-frame submit
+TX complete event
+HAL_ETH_ReleaseTxPacket()
+HAL_ETH_TxFreeCallback()
+TX Buffer recycle
+```
+
+这是 On-board functional/ownership 验证，不是 throughput benchmark。TX 小包/大包 PPS、线速、retry/backpressure 曲线尚未测量；是否在 M2 收尾前建立 TX 性能基线后续单独决定。
+
+## 8. 当前测试等级
 
 已确认：
 
@@ -201,30 +229,28 @@ Driver 当前没有软件 TX Queue；临时资源不足返回 `ETHERNET_TX_RETRY
 - Release Build：PASS；
 - map / ELF DMA layout：PASS；
 - On-board PHY / MAC startup：PASS；
-- On-board async RX 1000 / 1000：PASS；
-- On-board async TX 1000-frame completion ownership：PASS；
-- RuntimeTask 改名后的 RX regression：PASS；
-- CubeMX `As weak` / Package strong implementation：PASS。
+- On-board async RX / TX ownership：PASS；
+- Driver stats：PASS；
+- I-Cache Enabled：On-board Verified；
+- RX high-load / near-line-rate：Measured。
 
-未完成：Measured 高负载性能、长时间 Stress、D-Cache-on。
+未完成：真正长时间 Stress、D-Cache-on、完整 recovery/lifecycle、TX throughput baseline。
 
-## 7. M2 尚未完成
+## 9. M2 尚未完成
 
-- [ ] RX/TX error / drop 统计；
 - [ ] DMA fatal / RBU / timeout recovery；
+- [ ] async TX 异常路径完整 recovery；
 - [ ] Link Down / Up 完整 MAC lifecycle；
 - [ ] Task stack high-water mark；
 - [ ] D-Cache 场景；
-- [ ] 长时间 / 高负载。
+- [ ] 真正长时间 Stress；
+- [ ] TX throughput 性能基线是否作为 M2 退出项，待讨论。
 
-## 8. 下一工作单元建议
+## 10. 下一工作单元候选
 
-推荐下一步只做 **RX/TX 可观测性与基础统计**：
+优先候选：
 
-```text
-TX queued / retry / completion
-RX frame / error / drop
-HAL / DMA error snapshot
-```
+1. **Link Down / Up 完整 MAC lifecycle**：验证运行中拔线、重协商、MAC/DMA stop/reconfigure/start、RX/TX ownership 恢复；
+2. **TX throughput baseline**：如果决定 M2 同时冻结 TX 性能，则建立 60 B / 1514 B async TX benchmark 与 retry/completion 统计。
 
-目标是先让后续 Link lifecycle、error recovery、LwIP 和 Stress Test 有稳定可读的统计依据；不要在同一工作单元同时实现完整 recovery 或进入 LwIP。
+不要把两个候选同时塞进一个工作单元。

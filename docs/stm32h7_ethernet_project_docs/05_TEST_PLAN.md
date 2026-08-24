@@ -35,17 +35,20 @@
 - [x] SRAM3 clock 在 MX_ETH_Init 前准备；
 - [x] RX ownership / recycle — On-board Verified；
 - [x] TX copy-based async ownership / recycle — On-board Verified；
+- [x] I-Cache Enabled — On-board Verified + RX performance Measured；
 - [ ] TX 异常路径完整 recovery；
 - [ ] D-Cache-on。
 
-基线布局：
+当前布局：
 
 ```text
-DMARxDscrTab = 0x30040000
-DMATxDscrTab = 0x30040080
-.eth_dma_rx  = 0x30042000 / 0x1800
-.eth_dma_tx  = 0x30044000 / 0x1800
+DMARxDscrTab = 0x30040000 / 8 × 24 B
+DMATxDscrTab = 0x30040100 / 4 × 24 B
+.eth_dma_rx  = 0x30042000 / 0x3000 / 8 × 1536 B
+.eth_dma_tx  = 0x30045000 / 0x1800 / 4 × 1536 B
 ```
+
+MPU：SRAM3 32 KiB Normal Non-cacheable，前 512 B Device overlay。当前 I-Cache Enabled / D-Cache Disabled。
 
 ### 2. Raw Frame / RX
 
@@ -53,9 +56,11 @@ DMATxDscrTab = 0x30040080
 - [x] Raw RX 单帧；
 - [x] polling RX 1000 / 1000；
 - [x] async RX 1000 / 1000；
-- [x] `EthernetRtos_RuntimeTask()` 改名与 TX completion 加入后的 async RX 1000 / 1000 回归。
+- [x] `EthernetRtos_RuntimeTask()` 改名与 TX completion 加入后的 async RX 1000 / 1000 回归；
+- [x] RX high-load performance baseline — Measured；
+- [x] 1514 B near-line-rate RX — Measured。
 
-当前 RX 测试 EtherType `0x88B5`，PC 基础回归约 5 ms / Frame。1000 / 1000 只验证基础连续 ownership，不是 Stress。
+当前 RX 测试 EtherType `0x88B5`。
 
 ### 3. ETH IRQ + CMSIS-RTOS2 Runtime
 
@@ -102,11 +107,21 @@ EthernetDriver_TransmitAsync()
 - [x] 连续 1000-frame async TX 上板测试通过；
 - [x] 测试后 RX 1000 / 1000 回归通过。
 
-该结果验证基础 completion ownership 与 Buffer recycle，不代表高负载吞吐或异常 recovery。
+该结果验证基础 completion ownership 与 Buffer recycle，不代表 TX throughput 性能基线或异常 recovery。
 
-### 5. Driver Package / Reference Example 回归
+### 5. Driver 可观测性
 
-Reference Example 当前路径：
+- [x] RX frame / error / drop；
+- [x] RX buffer unavailable；
+- [x] TX queued / retry / error / completion；
+- [x] HAL error event count；
+- [x] last HAL / DMA / MAC error snapshot；
+- [x] `EthernetDriver_GetStats()` 只读快照 API；
+- [x] 高负载测试中使用统计确认 RBU/AIS 行为。
+
+### 6. Driver Package / Reference Example 回归
+
+Reference Example：
 
 ```text
 examples/STM32H743_LAN8720_FreeRTOS/
@@ -122,9 +137,10 @@ examples/STM32H743_LAN8720_FreeRTOS/
 - [x] async RX 1000 / 1000；
 - [x] async TX 1000-frame completion recycle；
 - [x] 无新增 HardFault；
-- [x] CubeMX Generate Code 后 USER CODE 边界保持正确。
+- [x] CubeMX Generate Code 后 USER CODE 边界保持正确；
+- [x] CubeMX 生成 I-Cache enable。
 
-### 6. CubeMX Runtime Task generation 回归
+### 7. CubeMX Runtime Task generation 回归
 
 当前采用：
 
@@ -134,7 +150,7 @@ Entry      = EthernetRtos_RuntimeTask
 Generation = As weak
 ```
 
-当前 Reference Example 已完成：
+已完成：
 
 - [x] CubeMX 6.18.1 UI 配置；
 - [x] Generate Code；
@@ -146,14 +162,52 @@ Generation = As weak
 - [x] async RX 回归；
 - [x] async TX completion 回归。
 
-### 7. M2 仍未完成
+### 8. RX 性能基线 — Measured
 
-- [ ] RX/TX error / drop 统计；
+测试脚本：`test/send_eth_stress.py`。测试固件使用 I-Cache Enabled、D-Cache Disabled、RX8/TX4、clean Runtime，无 DWT/linker-wrap profiler。
+
+60 B：
+
+| 输入 | 数量 | 结果 | HAL/RBU events |
+| --- | ---: | --- | ---: |
+| 110 kpps | 200000 | 200000 / 200000 | 0 |
+| 120 kpps | 200000 | 200000 / 200000 | 99 |
+| 120 kpps | 1000000 | 1000000 / 1000000 | 205 |
+| 130 kpps | 200000 | 200000 / 200000 | 52777 |
+| 140 kpps | 200000 | 186539 / 200000 | 186457 |
+| 148.59 kpps | 200000 | 175866 / 200000 | 175686 |
+
+两组过载测试的实际接收平台均约 `130.6 kpps`，约为 100BASE-TX 最小帧理论 `148.8 kpps` 的 `87.8%`。
+
+1514 B：
+
+```text
+8000 pps × 200000
+→ 200000 / 200000
+→ HAL/DMA error = 0
+→ script Frame rate = 96.90 Mbit/s
+→ estimated on-wire rate ≈ 98.43 Mbit/s
+```
+
+I-Cache 关闭时的历史 clean 60 B saturation 约 `71.1 kpps`；开启 I-Cache 后提升到约 `130.6 kpps`。该对比用于确认 I-Cache 是此前异常低小包性能的主要原因。
+
+诊断实验归档：
+
+- ReceiveView / one-copy：Rejected，未提升吞吐；
+- software RX interrupt batching：Rejected，吞吐下降；
+- RBUE-only disable：Rejected，吞吐明显下降；
+- I-Cache Enabled：Validated。
+
+### 9. M2 仍未完成
+
 - [ ] DMA fatal / RBU / timeout recovery；
 - [ ] Link Down / Up 完整 MAC lifecycle；
 - [ ] Task stack high-water mark；
-- [ ] 长时间 / 高负载；
-- [ ] D-Cache 场景。
+- [ ] D-Cache 场景；
+- [ ] 真正长时间 / 高负载 Stress；
+- [ ] TX throughput 性能基线是否纳入 M2 收尾，待后续决定。
+
+注意：`120 kpps × 1,000,000` 约 8.3 s，`1514 B × 200000 @ 8000 pps` 约 25 s，只能作为扩展高负载测试，不能替代数十分钟/数小时长时间 Stress。
 
 ## M3：LwIP + Ping
 

@@ -1,6 +1,6 @@
 # Ethernet DMA / MPU / Cache Design
 
-本文记录 Driver 对 DMA 内存、Descriptor、Buffer、MPU、Cache 和 linker 的约束，并以 STM32H743 Reference Example 的已验证布局作为示例。完整用户接入流程以根 README 为准；RX/TX Runtime 调用链见 `docs/ETHERNET_RUNTIME_FLOW.md`。
+本文记录 Driver 对 DMA 内存、Descriptor、Buffer、MPU、Cache 和 linker 的约束，并以 STM32H743 Reference Example 的当前已验证布局作为示例。完整用户接入流程以根 README 为准；RX/TX Runtime 调用链见 `docs/ETHERNET_RUNTIME_FLOW.md`。
 
 ## 1. 设计原则
 
@@ -41,23 +41,24 @@ RAM_D2
 examples/STM32H743_LAN8720_FreeRTOS/STM32H743xx_FLASH.ld
 ```
 
-Reason：Ethernet DMA 可达、与普通应用 RAM 分离、容量足够、便于用一个 MPU Region 管理。
+原因：Ethernet DMA 可达、与普通应用 RAM 分离、容量足够、便于用明确 MPU Region 管理。
 
 ## 3. Descriptor
 
+当前 `.ioc` / HAL 基线：
+
 ```text
-ETH_RX_DESC_CNT = 4
+ETH_RX_DESC_CNT = 8
 ETH_TX_DESC_CNT = 4
 sizeof(ETH_DMADescTypeDef) = 24 B
-4 × 24 B = 96 B
 ```
 
 布局：
 
-| 对象 | 地址 | 实际大小 | 预留 |
+| 对象 | 地址 | 实际大小 | linker 预留 |
 | --- | --- | ---: | ---: |
-| RX Descriptor | `0x30040000` | 96 B | 128 B |
-| TX Descriptor | `0x30040080` | 96 B | 128 B |
+| RX Descriptor | `0x30040000` | `8 × 24 = 192 B` | 256 B |
+| TX Descriptor | `0x30040100` | `4 × 24 = 96 B` | 256 B |
 
 CubeMX input section：
 
@@ -76,7 +77,7 @@ Reference linker：
     . = ALIGN(32);
 } >RAM_ETH
 
-.TxDescripSection 0x30040080 (NOLOAD) :
+.TxDescripSection 0x30040100 (NOLOAD) :
 {
     . = ALIGN(32);
     KEEP(*(.TxDescripSection))
@@ -84,15 +85,15 @@ Reference linker：
 } >RAM_ETH
 ```
 
-同时检查地址、section 非空、每组不超过 128 B slot。
+当前每组 slot 上限均为 `0x100`。
 
 ## 4. RX / TX Buffer Pool
 
-Driver 当前配置：
+Driver 数组数量直接跟随 HAL Descriptor Count：
 
 ```text
-RX Count  = 4
-TX Count  = 4
+RX Count  = ETH_RX_DESC_CNT = 8
+TX Count  = ETH_TX_DESC_CNT = 4
 Buffer    = 1536 B
 Alignment = 32 B
 ```
@@ -108,8 +109,8 @@ Reference Example 的物理布局：
 
 | 对象 | 地址范围 | 大小 |
 | --- | --- | ---: |
-| RX Pool | `0x30042000 ~ 0x300437FF` | `0x1800` / 6144 B |
-| TX Pool | `0x30044000 ~ 0x300457FF` | `0x1800` / 6144 B |
+| RX Pool | `0x30042000 ~ 0x30044FFF` | `0x3000` / 12288 B / 8×1536 B |
+| TX Pool | `0x30045000 ~ 0x300467FF` | `0x1800` / 6144 B / 4×1536 B |
 
 ```ld
 .eth_dma_rx 0x30042000 (NOLOAD) :
@@ -119,7 +120,7 @@ Reference Example 的物理布局：
     . = ALIGN(32);
 } >RAM_ETH
 
-.eth_dma_tx 0x30044000 (NOLOAD) :
+.eth_dma_tx 0x30045000 (NOLOAD) :
 {
     . = ALIGN(32);
     KEEP(*(.eth_dma_buffer.tx))
@@ -131,27 +132,30 @@ Reference Example 的物理布局：
 
 ```text
 0x30040000  RX Descriptor
-0x30040080  TX Descriptor
+0x30040100  TX Descriptor
+0x30040200  Descriptor overlay end + 1
 0x30042000  RX Pool
-0x30044000  TX Pool
-0x30045800  TX Pool end + 1
+0x30045000  TX Pool
+0x30046800  TX Pool end + 1
 0x30048000  RAM_ETH end + 1
 ```
 
 ## 5. Linker ASSERT
 
-Reference Example 使用地址/大小断言，至少保证：
+Reference Example 当前至少保证：
 
 ```text
 ADDR(.RxDescripSection) = 0x30040000
-ADDR(.TxDescripSection) = 0x30040080
+SIZEOF(.RxDescripSection) <= 0x100
+ADDR(.TxDescripSection) = 0x30040100
+SIZEOF(.TxDescripSection) <= 0x100
 ADDR(.eth_dma_rx)       = 0x30042000
-SIZEOF(.eth_dma_rx)     = 0x1800
-ADDR(.eth_dma_tx)       = 0x30044000
+SIZEOF(.eth_dma_rx)     = 0x3000
+ADDR(.eth_dma_tx)       = 0x30045000
 SIZEOF(.eth_dma_tx)     = 0x1800
 ```
 
-Descriptor Count / Buffer Count / Buffer Size 变化后必须同步修改 linker 预留与断言。
+Descriptor Count / Buffer Count / Buffer Size 变化后必须同步修改 `.ioc`、linker 预留/断言，并重新检查 map/ELF。
 
 ## 6. RX ownership
 
@@ -172,9 +176,7 @@ DMA owns RX Buffer
 → Frame Handler
 ```
 
-上层不会长期持有 DMA RX Buffer。copy-based ownership 已完成单帧、polling 1000/1000、async 1000/1000 上板验证。
-
-当前 RX 有两次 copy：
+上层不会长期持有 DMA RX Buffer。当前 RX 仍有两次 copy：
 
 ```text
 DMA RX Buffer
@@ -182,11 +184,11 @@ DMA RX Buffer
 → RTOS Adapter Frame
 ```
 
-第一版接受该开销以换取简单明确的 ownership。
+ReceiveView / one-copy 诊断实验没有提升最终吞吐，已回退；第一版继续保留 copy-first ownership。
 
 ## 7. TX ownership
 
-当前 TX 已切换为 copy-based async：
+当前 TX 为 copy-based async：
 
 ```text
 Caller Frame
@@ -204,11 +206,10 @@ Caller Frame
 关键点：
 
 1. `EthernetDriver_TransmitAsync()` 在提交前先尝试 `EthernetDriver_ProcessTxCompletions()`，作为 completion reclaim backstop；
-2. caller Frame 只在 `memcpy()` 前属于 caller，返回 `ETHERNET_TX_QUEUED` 后即可复用；
-3. `tx_config.pData` 保存 Driver TX DMA Buffer 地址，HAL 会把该地址记录到 `TxDescList.PacketAddress[]`；
-4. `HAL_ETH_ReleaseTxPacket()` 确认 Descriptor `OWN == 0` 后调用 `HAL_ETH_TxFreeCallback()`；
-5. `HAL_ETH_TxFreeCallback()` 最终把对应 Driver TX Buffer 标记为空闲；
-6. 当前没有隐藏的软件 TX Queue；无 Buffer/Descriptor 时返回 `ETHERNET_TX_RETRY`。
+2. 返回 `ETHERNET_TX_QUEUED` 后 caller Frame 可立即复用；
+3. `tx_config.pData` 保存 Driver TX DMA Buffer 地址，HAL 将其记录到 `TxDescList.PacketAddress[]`；
+4. `HAL_ETH_ReleaseTxPacket()` 完成后调用 `HAL_ETH_TxFreeCallback()`；
+5. 当前没有隐藏的软件 TX Queue；无 Buffer/Descriptor 时返回 `ETHERNET_TX_RETRY`。
 
 当前 TX 只有一次 copy：
 
@@ -220,27 +221,7 @@ Caller Frame
 
 ## 8. TX submit / reclaim 并发保护
 
-`HAL_ETH_Transmit_IT()` 与 `HAL_ETH_ReleaseTxPacket()` 都会操作 HAL TX Descriptor bookkeeping：
-
-```text
-CurTxDesc
-PacketAddress[]
-BuffersInUse
-releaseIndex
-Descriptor OWN / IOC
-```
-
-当前 Driver 使用短 PRIMASK critical section 序列化：
-
-```text
-TX Pool acquire/release
-HAL_ETH_Transmit_IT()
-HAL_ETH_ReleaseTxPacket()
-```
-
-Frame `memcpy()` 不放在整个关中断区内。
-
-这个临界区用于保证 TX submit 与 reclaim 不并发破坏同一套 HAL/Driver ownership 状态；Driver Core 因此仍不依赖 FreeRTOS mutex。
+`HAL_ETH_Transmit_IT()` 与 `HAL_ETH_ReleaseTxPacket()` 都会操作 HAL TX Descriptor bookkeeping。当前 Driver 使用短 PRIMASK critical section 序列化 TX Pool acquire/release、HAL submit 和 reclaim；Frame `memcpy()` 不放在整个关中断区内。
 
 ## 9. MPU
 
@@ -263,11 +244,10 @@ Region 2：
 
 ```text
 Base          0x30040000
-Size          256 B
+Size          512 B
 TEX           0
 Access        Full Access
 XN            Yes
-Shareable     No
 Cacheable     No
 Bufferable    Yes
 ```
@@ -275,15 +255,25 @@ Bufferable    Yes
 Region 2 编号更高，因此：
 
 ```text
-0x30040000 ~ 0x300400FF  Device / Non-cacheable
-0x30040100 ~ 0x30047FFF  Normal / Non-cacheable
+0x30040000 ~ 0x300401FF  Device / Non-cacheable
+0x30040200 ~ 0x30047FFF  Normal / Non-cacheable
 ```
 
-## 10. D-Cache
+512 B overlay 覆盖 RX/TX Descriptor 预留区，不覆盖 payload Pool。
 
-当前 Example I-Cache / D-Cache Disabled，且 Ethernet SRAM3 Non-cacheable。
+## 10. I-Cache / D-Cache
 
-如果以后把 Buffer 放到 Cacheable RAM，必须重新设计：
+当前 Reference Example：
+
+```text
+I-Cache = Enabled
+D-Cache = Disabled
+Ethernet SRAM3 = Non-cacheable
+```
+
+I-Cache 已通过 RX 性能单变量实验验证为关键配置：关闭时 60 B clean saturation 约 `71.1 kpps`；开启后 clean saturation 约 `130.6 kpps`。I-Cache 影响 Flash 代码取指，不改变 Ethernet DMA Buffer 的 data coherence。
+
+D-Cache-on 尚未验证。如果以后把 Buffer 放到 Cacheable RAM，必须重新设计：
 
 - Clean / Invalidate 时机；
 - 地址/长度向 32-byte Cache Line 扩展；
@@ -291,7 +281,7 @@ Region 2 编号更高，因此：
 - memory barrier；
 - HAL Descriptor 生命周期。
 
-在内存属性不变前，不提前往通用 Driver 加没有实际需求的 Cache maintenance 抽象。
+在内存属性不变前，不提前往通用 Driver 加未验证的 Cache maintenance 抽象。
 
 ## 11. SRAM3 clock / Port
 
@@ -305,6 +295,7 @@ examples/STM32H743_LAN8720_FreeRTOS/BSP/stm32h743vit6_iot/ethernet_port.c
 
 ```text
 MPU_Config
+→ I-Cache enable
 → HAL_Init
 → SystemClock_Config
 → EthernetPort_PrepareDmaMemory
@@ -317,8 +308,9 @@ MPU_Config
 
 ```text
 Example .ioc
-→ ETH Descriptor addresses
+→ ETH Descriptor count / addresses
 → MPU Regions
+→ CPU Cache enable state
 
 Example linker
 → RAM_ETH physical region
@@ -336,7 +328,7 @@ Driver
 
 `cmake/stm32cubemx/CMakeLists.txt` 属于生成文件，不手工修改。
 
-CubeMX 6.18.1 可能在 `.ioc` 内保留 MMT metadata，但当前 `MMTConfigApplied=false`；项目实际 DMA layout 仍以 linker + map/ELF 为准。
+CubeMX 6.18.1 可能在 `.ioc` 内保留 MMT metadata，但当前 `MMTConfigApplied=false`；项目实际 DMA layout 仍以 `.ioc` + linker + map/ELF 为准。
 
 ## 13. Map / ELF 验证
 
@@ -350,13 +342,13 @@ arm-none-eabi-nm -n build/Debug/stm32H7ethernet_demo.elf | \
   grep -E "DMARxDscrTab|DMATxDscrTab"
 ```
 
-当前 Reference Example 迁移到 `examples/` 并完成 RuntimeTask / async TX 修改后，仍已验证：
+当前目标布局：
 
 ```text
 DMARxDscrTab = 0x30040000
-DMATxDscrTab = 0x30040080
-.eth_dma_rx  = 0x30042000 / 0x1800
-.eth_dma_tx  = 0x30044000 / 0x1800
+DMATxDscrTab = 0x30040100
+.eth_dma_rx  = 0x30042000 / 0x3000
+.eth_dma_tx  = 0x30045000 / 0x1800
 ```
 
 ## 14. 当前验证边界
@@ -364,24 +356,35 @@ DMATxDscrTab = 0x30040080
 已验证：
 
 ```text
-RX copy-based ownership + async RX 1000/1000
+RX copy-based ownership + async RX
 TX copy-based async ownership + 1000-frame completion recycle
-RuntimeTask 改名后的 RX 回归
-map / ELF DMA layout
+current RX8/TX4 linker layout
+I-Cache Enabled
+60 B high-load RX clean baseline
+1514 B near-line-rate RX baseline
+```
+
+Measured RX：
+
+```text
+60 B @ 120 kpps × 1,000,000 → 100% received
+60 B saturation platform     → ~130.6 kpps
+1514 B @ 8000 pps × 200,000 → 100% received, 0 HAL/DMA error
 ```
 
 尚未验证：
 
 ```text
 D-Cache-on
-高负载 / 长时间 Stress
+真正长时间 Stress
 DMA fatal / timeout recovery
-Link lifecycle 下的 Buffer/Descriptor recovery
+完整 Link lifecycle 下的 Buffer/Descriptor recovery
+TX throughput baseline
 ```
 
 ## 15. 跨板迁移
 
-必须重新确认目标 MCU 的：DMA 可达 SRAM、容量、clock、MPU base/size/attribute、Descriptor/Buffer 地址、linker MEMORY、map/ELF 实际地址。
+必须重新确认目标 MCU 的 DMA 可达 SRAM、容量、clock、MPU base/size/attribute、Descriptor/Buffer 地址、linker MEMORY、map/ELF 实际地址。
 
 通用 `Ethernet/` 中不得出现当前板物理事实：
 

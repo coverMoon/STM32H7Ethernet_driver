@@ -90,11 +90,20 @@ bool EthernetDriver_Start(void);
 EthernetTxResult EthernetDriver_TransmitAsync(const uint8_t *frame, uint16_t length);
 void EthernetDriver_ProcessTxCompletions(void);
 EthernetRxResult EthernetDriver_Receive(uint8_t *frame, uint16_t capacity, uint16_t *length);
+bool EthernetDriver_GetStats(EthernetDriverStats *stats);
 ```
 
 Driver Core 不依赖 FreeRTOS。HAL RX/TX complete callback 只向上转发 ISR event，不在 ISR 中执行 Frame 读取、Descriptor reclaim、协议解析或应用业务。
 
-当前使用 4 RX + 4 TX Descriptor、4×1536 B RX Pool、4×1536 B TX Pool。
+当前 Reference Example 使用：
+
+```text
+RX Descriptor = 8
+TX Descriptor = 4
+RX Pool       = 8 × 1536 B
+TX Pool       = 4 × 1536 B
+Alignment     = 32 B
+```
 
 ### RX ownership
 
@@ -103,8 +112,10 @@ RX DMA Buffer
 → HAL_ETH_RxLinkCallback()
 → copy 到 Driver CPU 单帧暂存
 → 立即归还 RX Pool
-→ EthernetDriver_Receive() copy 给调用者
+→ EthernetDriver_Receive() 再 copy 给调用者
 ```
+
+第一版保持 copy-first，不主动追求 Zero Copy。
 
 ### TX ownership
 
@@ -140,14 +151,7 @@ EthernetRtos_IsReady()
 EthernetRtos_RuntimeTask()
 ```
 
-Runtime Task 启动时自动绑定：
-
-```text
-EthernetDriver_SetRxEventHandler(EthernetRtos_OnRxEvent)
-EthernetDriver_SetTxEventHandler(EthernetRtos_OnTxEvent)
-```
-
-运行链路：
+Runtime Task 启动时自动绑定 Driver RX/TX event。运行链路：
 
 ```text
 RX:
@@ -181,7 +185,7 @@ Task Entry : EthernetRtos_RuntimeTask
 Generation : As weak
 ```
 
-CubeMX 管理 Task attributes / `osThreadNew()`，Package 提供同名强定义 Task Entry；Generate Code、Build、async RX 与 async TX 上板回归均已通过。
+CubeMX 管理 Task attributes / `osThreadNew()`，Package 提供同名强定义 Task Entry。
 
 ## 7. Runtime Handler 边界
 
@@ -216,20 +220,30 @@ Ethernet Frame API / RTOS runtime
 
 当前 ethernetif / LwIP 尚未实现。Driver 不提前包含 pbuf、IP、Socket 或协议语义。
 
-## 9. DMA / MPU / linker 边界
+## 9. DMA / MPU / Cache / linker 边界
 
-物理 DMA 地址属于目标工程，不属于 Driver Package。必须显式确定：
+物理 DMA 地址属于目标工程，不属于 Driver Package。必须显式确定：DMA Master 可达 SRAM、Descriptor / Buffer 地址、32-byte alignment、MPU Memory Attribute、D-Cache 策略、ownership、linker section 和 map/ELF 实际地址。
 
-- DMA Master 可达 SRAM；
-- Descriptor / Buffer 地址；
-- 32-byte alignment；
-- MPU Memory Attribute；
-- D-Cache 策略；
-- ownership；
-- linker section；
-- map/ELF 实际地址。
+当前 STM32H743 Example：
 
-当前 STM32H743 Example 使用 SRAM3 `0x30040000 / 32 KiB`，Non-cacheable，前 256 B Device overlay。详细见 `03_MEMORY_DMA.md`。
+```text
+RAM_ETH = SRAM3 = 0x30040000 / 32 KiB
+RX Desc = 0x30040000 / 8 × 24 B
+TX Desc = 0x30040100 / 4 × 24 B
+RX Pool = 0x30042000 / 0x3000 / 8 × 1536 B
+TX Pool = 0x30045000 / 0x1800 / 4 × 1536 B
+```
+
+MPU：整个 SRAM3 为 Normal Non-cacheable；`0x30040000 ~ 0x300401FF` 为 512 B Device overlay，覆盖 Descriptor 区域。
+
+Reference Example 当前：
+
+```text
+I-Cache = Enabled
+D-Cache = Disabled
+```
+
+I-Cache 只影响 CPU 指令取值，不改变 Ethernet DMA data coherence；D-Cache-on 仍需单独设计和验证。详细见 `03_MEMORY_DMA.md`。
 
 ## 10. CubeMX 与维护边界
 
@@ -263,16 +277,20 @@ Task / RTOS 资源配置
 
 ## 12. 当前验证
 
-已 On-board Verified：
+已 On-board Verified / Measured：
 
 ```text
 PHY bring-up
 Raw TX/RX
 polling RX 1000/1000
 async RX 1000/1000
-async TX 1000-frame continuous submit / completion recycle
-EthernetRuntime + EthernetRtos_RuntimeTask + As weak
-RuntimeTask 改名后的 RX 1000/1000 回归
+async TX 1000-frame completion recycle
+EthernetRuntime + As weak integration
+Driver stats / HAL-DMA error snapshot
+60 B RX high-load clean baseline
+1514 B RX near-line-rate baseline
 ```
 
-Driver Package 化、Reference Example 移入 `examples/`、CubeMX Runtime Task 方案均已完成 Build / map / On-board 回归。
+RX clean baseline：60 B 饱和平台约 `130.6 kpps`；1514 B @ 8000 pps、200000 帧零丢包，估算 on-wire 约 `98.43 Mbit/s`。
+
+当前 TX throughput 尚未建立 Measured 性能基线；已有结果只证明 async TX ownership / completion recycle 正确。

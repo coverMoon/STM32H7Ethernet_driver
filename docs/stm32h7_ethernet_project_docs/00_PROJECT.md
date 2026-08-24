@@ -72,29 +72,52 @@ Reference Example 内部包含 CubeMX `.ioc`、Core、CMSIS/HAL、FreeRTOS、BSP
 已完成并验证：
 
 - STM32H743 DMA SRAM / MPU / linker；
-- RX/TX Descriptor 与静态 Buffer Pool；
+- RX 8 Descriptor + TX 4 Descriptor；
+- RX 8×1536 B / TX 4×1536 B 静态 DMA Pool；
 - copy-based RX ownership；
-- Raw TX / RX；
-- polling RX 1000 / 1000；
-- ETH IRQ；
+- copy-based async TX completion ownership；
+- Raw TX / RX、polling RX、ETH IRQ；
 - `HAL_ETH_Start_IT()`；
-- CMSIS-RTOS2 Thread Flag；
+- CMSIS-RTOS2 Thread Flag + `EthernetRtos_RuntimeTask()`；
 - async RX 1000 / 1000；
-- Driver Package Port / RTOS Adapter 重构；
-- 完整 Reference Example 移入 `examples/` 后重新 Build / map / On-board 回归；
-- CubeMX `EthernetRuntime + EthernetRtos_RuntimeTask + As weak` 集成；
-- copy-based async TX；
-- `HAL_ETH_Transmit_IT()` → TX complete event → Runtime Task → `HAL_ETH_ReleaseTxPacket()` → `HAL_ETH_TxFreeCallback()`；
-- async TX 1000-frame 连续提交与 TX Buffer recycle 上板验证；
-- RuntimeTask 改名后的 async RX 1000 / 1000 回归。
+- async TX 1000-frame completion recycle；
+- Driver 统计接口与 HAL/DMA error snapshot；
+- Reference Example I-Cache Enabled、D-Cache Disabled；
+- 60 B RX 高负载性能定位与 clean baseline；
+- 1514 B RX 接近 100 Mbit/s 线速验证。
 
-仍未完成：RX/TX error/drop 统计、DMA/MAC error recovery、完整 Link lifecycle、Task stack high-water mark、长时间/高负载、D-Cache-on 专项验证。
+RX 性能已 Measured：
+
+```text
+60 B, 120 kpps, 1,000,000 frames : 100% received, 205 HAL/RBU events
+60 B saturation platform          : ~130.6 kpps
+1514 B, 8000 pps, 200,000 frames : 100% received, 0 HAL/DMA error
+1514 B estimated on-wire rate     : ~98.43 Mbit/s
+```
+
+当前 TX 只完成 async ownership / completion recycle 功能验证，尚未建立 TX throughput 性能基线。
+
+M2 仍未完成：DMA fatal/RBU/timeout recovery、完整 Link lifecycle、Task stack high-water mark、D-Cache-on、真正长时间 Stress；TX 性能是否作为 M2 独立基线后续再决定。
 
 ### M3 ～ M6
 
-LwIP / Ping / UDP / TCP / Stress 尚未进入。
+LwIP / Ping / UDP / TCP / 系统级 Stress 尚未进入。
 
-## 5. 当前 Runtime 形态
+## 5. 当前 Reference Example 基线
+
+```text
+RAM_ETH = SRAM3 = 0x30040000 / 32 KiB
+RX Desc = 0x30040000 / 8 × 24 B
+TX Desc = 0x30040100 / 4 × 24 B
+RX Pool = 0x30042000 / 0x3000 / 8 × 1536 B
+TX Pool = 0x30045000 / 0x1800 / 4 × 1536 B
+I-Cache = Enabled
+D-Cache = Disabled
+```
+
+MPU：整个 SRAM3 为 Normal Non-cacheable；前 512 B 为 Device overlay，覆盖 RX/TX Descriptor 区域。
+
+## 6. 当前 Runtime 形态
 
 Reference Example 当前 CubeMX Task：
 
@@ -118,19 +141,18 @@ TX complete event
 
 完整原理见 `docs/ETHERNET_RUNTIME_FLOW.md`。
 
-## 6. 当前产品化状态
+## 7. 当前产品化状态
 
 已完成：
 
 - `Ethernet/` 为仓库根目录产品；
 - 完整 STM32H743 Reference Example 位于 `examples/STM32H743_LAN8720_FreeRTOS/`；
 - Example CMake 通过 `../../Ethernet` 引用共享 Package；
-- 根 README 作为完整集成指南；
-- 原 `docs/BOARD_PORTING.md` 的迁移职责合并到 README，删除重复文档；
+- 根 README 作为集成指南并记录已实测 Reference Example RX 性能基线；
 - CubeMX Task 使用 `EthernetRtos_RuntimeTask + As weak`，CubeMX 管 Task 资源，Package 提供强定义实现；
 - `docs/ETHERNET_RUNTIME_FLOW.md` 统一解释 weak symbol、HAL callback、运行时 Handler、IRQ/Task、RX/TX Buffer ownership。
 
-## 7. 多对话状态管理
+## 8. 多对话状态管理
 
 项目真实状态以远程 `main` 为准。默认先读取：
 
@@ -142,13 +164,13 @@ TX complete event
 6. `08_HANDOFF.md`
 7. 当前任务所需代码、`.ioc`、linker、HAL、Datasheet / Reference Manual
 
-## 8. 文档边界
+## 9. 文档边界
 
 面向使用者：根 `README.md` 是首要 Integration Guide，可独立完成关键 CubeMX / DMA / MPU / linker / Port / RTOS 接入。
 
 专题文档继续提供更深的架构、硬件、内存、RTOS 和 Runtime 原理说明；`05_TEST_PLAN.md`、`06_DECISIONS.md`、`07_STATUS.md`、`08_HANDOFF.md` 属于项目控制文档。
 
-## 9. CubeMX / 手工代码边界
+## 10. CubeMX / 手工代码边界
 
 Reference Example 中 `.ioc`、`Core/**`、ST Drivers、FreeRTOS、`cmake/stm32cubemx/CMakeLists.txt` 由 CubeMX/ST 管理；Core 手工逻辑只放 USER CODE 区域。
 

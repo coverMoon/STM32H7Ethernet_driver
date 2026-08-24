@@ -41,7 +41,7 @@ repository root
         └── flash.sh
 ```
 
-Example 的顶层 `CMakeLists.txt` 通过 `../../Ethernet` 引用仓库根目录 Driver Package，因此不要把一份 Driver 副本复制进 Example。
+Example 顶层 `CMakeLists.txt` 通过 `../../Ethernet` 引用仓库根目录 Driver Package。
 
 ## 2. CubeMX / 手工代码边界
 
@@ -57,9 +57,7 @@ cmake/stm32cubemx/CMakeLists.txt
 startup / system 等生成内容
 ```
 
-对 `Core/**` 的长期手工逻辑只放在 `USER CODE BEGIN / END` 区域。
-
-不要手工修改：
+对 `Core/**` 的长期手工逻辑只放在 `USER CODE BEGIN / END` 区域。不要手工修改：
 
 ```text
 cmake/stm32cubemx/CMakeLists.txt
@@ -71,24 +69,29 @@ cmake/stm32cubemx/CMakeLists.txt
 BSP/stm32h743vit6_iot/ethernet_port.c
 ```
 
-## 3. 当前 Ethernet DMA 内存
+## 3. 当前 Ethernet DMA / Cache 基线
 
 ```text
 RAM_ETH      = 0x30040000 / 32 KiB
-RX Desc      = 0x30040000
-TX Desc      = 0x30040080
-RX Pool      = 0x30042000 / 0x1800 / 4 × 1536 B
-TX Pool      = 0x30044000 / 0x1800 / 4 × 1536 B
+RX Desc      = 0x30040000 / 8 × 24 B
+TX Desc      = 0x30040100 / 4 × 24 B
+RX Pool      = 0x30042000 / 0x3000 / 8 × 1536 B
+TX Pool      = 0x30045000 / 0x1800 / 4 × 1536 B
 ```
 
 MPU：
 
 ```text
-SRAM3 whole region : Normal Non-cacheable
-first 256 B        : Device overlay for descriptors
+SRAM3 whole region            : Normal Non-cacheable
+0x30040000 ~ 0x300401FF       : 512 B Device overlay for descriptors
 ```
 
-当前 I-Cache / D-Cache 均关闭。
+CPU Cache：
+
+```text
+I-Cache = Enabled
+D-Cache = Disabled
+```
 
 `STM32H743xx_FLASH.ld` 是本 Example 的板级 linker，不属于 Driver Package 固定配置。
 
@@ -103,7 +106,7 @@ first 256 B        : Device overlay for descriptors
 ./build.sh Release --fresh
 ```
 
-或者使用 CMake Preset：
+或者：
 
 ```bash
 cmake --preset Debug
@@ -130,9 +133,9 @@ arm-none-eabi-nm -n build/Debug/stm32H7ethernet_demo.elf | \
 
 ```text
 DMARxDscrTab = 0x30040000
-DMATxDscrTab = 0x30040080
-.eth_dma_rx  = 0x30042000 / 0x1800
-.eth_dma_tx  = 0x30044000 / 0x1800
+DMATxDscrTab = 0x30040100
+.eth_dma_rx  = 0x30042000 / 0x3000
+.eth_dma_tx  = 0x30045000 / 0x1800
 ```
 
 不要只以“成功编译”替代 map / ELF 地址检查。
@@ -145,7 +148,7 @@ DMATxDscrTab = 0x30040080
 ./flash.sh Debug
 ```
 
-脚本会优先使用 `STM32_Programmer_CLI`，也支持 `st-flash`。可以先只检查环境和固件：
+脚本会优先使用 `STM32_Programmer_CLI`，也支持 `st-flash`。可以先检查环境和固件：
 
 ```bash
 ./flash.sh Debug --check
@@ -153,7 +156,7 @@ DMATxDscrTab = 0x30040080
 
 ## 7. FreeRTOS Runtime Task
 
-当前 CubeMX 配置已经冻结并验证：
+当前 CubeMX 配置：
 
 ```text
 Task Name  : EthernetRuntime
@@ -164,31 +167,20 @@ Generation : As weak
 Allocation : Dynamic
 ```
 
-CubeMX 负责：
-
-```text
-Task object
-priority
-stack
-allocation
-osThreadNew()
-weak Task stub
-```
-
-Package 中：
+CubeMX 负责 Task object、priority、stack、allocation、`osThreadNew()` 和 weak Task stub；Package 中：
 
 ```text
 Ethernet/RTOS/CMSIS_RTOS2/Src/ethernet_rtos.c
 ```
 
-提供同名强定义 `EthernetRtos_RuntimeTask()`，最终负责：
+提供同名强定义 `EthernetRtos_RuntimeTask()`，负责：
 
 ```text
 RX deferred processing
 TX completion reclaim
 ```
 
-Driver Package 本身仍不创建 Task。
+Driver Package 本身不创建 Task。
 
 ## 8. 正常启动日志
 
@@ -204,19 +196,11 @@ Driver Package 本身仍不创建 Task。
 [ETH] MAC/DMA started
 ```
 
-Runtime Task 自身不在高速路径打印启动日志。
+Runtime Task 自身不在高速路径打印日志。
 
-## 9. Async RX 测试
+## 9. Async RX 路径
 
 当前 Demo 使用 EtherType `0x88B5` 做 Raw Frame RX 验证。
-
-PC 连续发送 1000 帧时，已验证：
-
-```text
-[ETH] Async RX test 1000/1000 PASS, total=1000
-```
-
-当前 RX 路径：
 
 ```text
 ETH IRQ
@@ -228,53 +212,15 @@ ETH IRQ
 → EthernetDemo_RxFrameHandler()
 ```
 
-该测试验证基础连续 ownership，不是吞吐极限或长时间 Stress Test。
+基础 async RX 1000 / 1000 已通过。
 
-## 10. Async TX 测试
+## 10. Async TX 路径
 
-当前 Demo 默认启用：
-
-```text
-ETHERNET_ASYNC_TX_TEST_ENABLE = 1
-ETHERNET_TX_TEST_TARGET_COUNT = 1000
-```
-
-MAC/DMA 启动成功后，BootstrapTask 连续调用：
-
-```c
-EthernetDriver_TransmitAsync();
-```
-
-测试 Frame：
+当前 Demo 已验证 1000-frame async TX completion ownership：
 
 ```text
-Destination MAC : ff:ff:ff:ff:ff:ff
-EtherType       : 0x88B5
-Frame Length    : 60 B
-尾部 4 B        : 发送序号
-```
-
-临时没有 TX Buffer / Descriptor 时：
-
-```text
-ETHERNET_TX_RETRY
-→ osDelay(1)
-→ retry
-```
-
-每 100 帧输出一次：
-
-```text
-[ETH] Async TX queued=100
-...
-[ETH] Async TX queued=1000
-[ETH] Async TX queued 1000/1000
-```
-
-当前 TX completion 路径：
-
-```text
-HAL_ETH_Transmit_IT()
+EthernetDriver_TransmitAsync()
+→ HAL_ETH_Transmit_IT()
 → TX IRQ
 → HAL_ETH_TxCpltCallback()
 → TX Thread Flag
@@ -285,9 +231,67 @@ HAL_ETH_Transmit_IT()
 → TX Buffer recycle
 ```
 
-该 1000-frame 测试已上板通过，并且完成后重新执行 async RX 1000 / 1000 回归也通过。
+临时没有 TX Buffer / Descriptor 时返回 `ETHERNET_TX_RETRY`。当前没有软件 TX Queue。
 
-## 11. 当前验证等级
+该 1000-frame 测试证明 completion ownership / Buffer recycle 正确，不代表 TX throughput 性能。
+
+## 11. Driver stats
+
+`EthernetDriver_GetStats()` 当前提供：
+
+```text
+rx_frames / rx_errors / rx_dropped / rx_buffer_unavailable
+tx_queued / tx_retries / tx_errors / tx_completed
+hal_error_events
+last_hal_error_code / last_dma_error_code / last_mac_error_code
+```
+
+高负载测试可从任务上下文打印 `[ETH][STAT]`，不要在 ETH ISR 中 `printf`。
+
+## 12. RX Stress / Performance
+
+PC 侧脚本：
+
+```text
+test/send_eth_stress.py
+```
+
+示例：
+
+```bash
+sudo python3 test/send_eth_stress.py enp8s0 -n 200000 --size 60 --pps 120000
+sudo python3 test/send_eth_stress.py enp8s0 -n 200000 --size 1514 --pps 8000
+```
+
+当前 clean baseline 使用 I-Cache Enabled、D-Cache Disabled、RX8/TX4，无临时 DWT/linker-wrap profiler。
+
+### 60 B
+
+```text
+110 kpps × 200000 → 200000 / 200000, HAL=0
+120 kpps × 1M     → 1000000 / 1000000, HAL=205
+130 kpps × 200000 → 200000 / 200000, HAL=52777
+140 kpps × 200000 → 186539 / 200000
+148.59 kpps       → 175866 / 200000
+```
+
+当前饱和接收平台约 `130.6 kpps`，约为 100BASE-TX 最小帧理论 `148.8 kpps` 的 `87.8%`。
+
+### 1514 B
+
+```text
+8000 pps × 200000
+→ 200000 / 200000
+→ HAL/DMA error = 0
+→ script frame rate = 96.90 Mbit/s
+→ estimated on-wire ≈ 98.43 Mbit/s
+```
+
+I-Cache Disabled 时历史 60 B clean saturation 约 `71.1 kpps`；Enabled 后约 `130.6 kpps`。因此 I-Cache Enabled 是当前 Reference Example 正式配置。
+
+当前尚未建立 TX throughput 性能基线。
+
+## 13. 当前验证等级
 
 已确认：
 
@@ -305,22 +309,25 @@ Polling RX 1000 / 1000
 Async RX 1000 / 1000
 EthernetRuntime / As weak Task integration
 Async TX 1000-frame completion recycle
-RuntimeTask 改名后的 RX 1000 / 1000 regression
+Driver stats
+I-Cache Enabled
+RX 60 B high-load baseline
+RX 1514 B near-line-rate baseline
 ```
 
 未完成：
 
 ```text
-RX/TX error/drop 统计
-DMA fatal / timeout recovery
+DMA fatal / RBU / timeout recovery
 Link lifecycle
 Task stack high-water mark
 D-Cache-on
-高负载 / 长时间 Stress
+真正长时间 Stress
+TX throughput baseline
 LwIP / Ping / UDP / TCP
 ```
 
-运行时 callback、Thread Flag、RX/TX Buffer ownership 的完整原理说明见仓库根目录：
+运行时 callback、Thread Flag、RX/TX Buffer ownership 的完整原理说明见：
 
 ```text
 docs/ETHERNET_RUNTIME_FLOW.md
