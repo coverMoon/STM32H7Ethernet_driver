@@ -142,8 +142,7 @@ static bool EthernetDriver_IsRxDescriptorReady(const ETH_HandleTypeDef *eth_hand
 
     desc_index = eth_handle->RxDescList.RxDescIdx;
 
-    if ((desc_index >= ETH_RX_DESC_CNT) ||
-        (eth_handle->RxDescList.RxDesc[desc_index] == 0U))
+    if ((desc_index >= ETH_RX_DESC_CNT) || (eth_handle->RxDescList.RxDesc[desc_index] == 0U))
     {
         return false;
     }

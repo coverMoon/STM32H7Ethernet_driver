@@ -263,7 +263,7 @@ SECTIONS
   ASSERT(SIZEOF(.RxDescripSection) <= 0x100,
          "Ethernet RX descriptors exceed reserved slot")
 
-  ASSERT(ADDR(.TxDescripSection) == 0x30040080,
+  ASSERT(ADDR(.TxDescripSection) == 0x30040100,
          "Ethernet TX descriptor address mismatch")
 
   ASSERT(SIZEOF(.TxDescripSection) <= 0x100,

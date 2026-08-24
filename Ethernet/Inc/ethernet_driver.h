@@ -101,20 +101,7 @@ bool EthernetDriver_Start(void);
 EthernetTxResult EthernetDriver_TransmitAsync(const uint8_t *frame, uint16_t length);
 void EthernetDriver_ProcessTxCompletions(void);
 EthernetRxResult EthernetDriver_Receive(uint8_t *frame, uint16_t capacity, uint16_t *length);
-
-/**
- * @brief  重新使能 RX complete 中断。
- *
- * @details
- * RX complete ISR 在唤醒 Runtime Task 后会临时屏蔽 RIE，让任务一次批量
- * drain 当前所有可读 Frame。任务在 drain 到 ETHERNET_RX_NONE / ERROR 后
- * 调用本函数重新进入“等待首包中断”状态。
- *
- * 该接口只恢复 RX complete interrupt，不改变 TX / fatal error interrupt。
- * 应在任务上下文调用。
- */
 void EthernetDriver_RearmRxInterrupt(void);
-
 bool EthernetDriver_GetStats(EthernetDriverStats *stats);
 
 #ifdef __cplusplus
