@@ -54,17 +54,6 @@ target_include_directories(${CMAKE_PROJECT_NAME} PRIVATE
 target_compile_definitions(${CMAKE_PROJECT_NAME} PRIVATE
 )
 
-#
-# RX 性能诊断专用：
-# 通过 GNU ld --wrap 拦截 HAL_ETH_ReadData() 与 HAL_ETH_IRQHandler()，
-# 在不修改 ST HAL 的前提下分别测量 RX task-side HAL 路径和 ETH IRQ handler。
-# 完成瓶颈定位后应删除这些 wrap 选项。
-#
-target_link_options(${CMAKE_PROJECT_NAME} PRIVATE
-    -Wl,--wrap=HAL_ETH_ReadData
-    -Wl,--wrap=HAL_ETH_IRQHandler
-)
-
 list(REMOVE_ITEM CMAKE_C_IMPLICIT_LINK_LIBRARIES ob)
 
 target_link_libraries(${CMAKE_PROJECT_NAME}
