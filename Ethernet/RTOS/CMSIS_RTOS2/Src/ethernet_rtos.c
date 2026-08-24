@@ -4,6 +4,7 @@
 #include <stddef.h>
 #include <stdint.h>
 #include <stdio.h>
+#include <string.h>
 
 #include "cmsis_os2.h"
 #include "ethernet_driver.h"
@@ -16,9 +17,13 @@
 
 /*
  * 性能诊断专用：
- * 保持原 RX 行为不变，只在热路径中记录 DWT cycle 和事件计数。
- * 报告仅在 RX 连续空闲 250 ms 后打印，避免串口输出干扰压力测试。
- * 完成瓶颈定位后应移除或关闭这段 profiling。
+ * - 不改变 RX ownership、IRQ 使能状态或 drain 策略；
+ * - 将 ETHERNET_RX_FRAME / ETHERNET_RX_NONE 的 Receive() 耗时分别统计；
+ * - 通过 GNU ld --wrap=HAL_ETH_ReadData 单独测量 HAL_ETH_ReadData()；
+ * - 仅在 RX 连续空闲 250 ms 后打印并清空本轮统计，避免串口干扰热路径。
+ *
+ * 当前计数面向 20 万帧量级的短时压力测试，cycle 累计使用 uint32_t；
+ * 每次报告后都会清零，避免长时间累计溢出。
  */
 #define ETHERNET_RX_PROFILE_ENABLE          1
 #define ETHERNET_RX_PROFILE_IDLE_REPORT_MS 250U
@@ -29,18 +34,30 @@ typedef struct
     volatile uint32_t rx_irq_events;
     uint32_t rx_runtime_wakeups;
 
-    uint32_t rx_receive_calls;
-    uint32_t rx_receive_frames;
-    uint32_t rx_receive_none;
-    uint32_t rx_receive_errors;
-    uint64_t rx_receive_cycles_total;
-    uint32_t rx_receive_cycles_max;
+    uint32_t frame_read_calls;
+    uint32_t frame_read_cycles_total;
+    uint32_t frame_read_cycles_max;
 
-    uint32_t rx_handler_calls;
-    uint64_t rx_handler_cycles_total;
-    uint32_t rx_handler_cycles_max;
+    uint32_t none_read_calls;
+    uint32_t none_read_cycles_total;
+    uint32_t none_read_cycles_max;
 
-    uint32_t reported_rx_frames;
+    uint32_t error_read_calls;
+    uint32_t error_read_cycles_total;
+    uint32_t error_read_cycles_max;
+
+    uint32_t handler_calls;
+    uint32_t handler_cycles_total;
+    uint32_t handler_cycles_max;
+
+    uint32_t hal_frame_calls;
+    uint32_t hal_frame_cycles_total;
+    uint32_t hal_frame_cycles_max;
+
+    uint32_t hal_none_calls;
+    uint32_t hal_none_cycles_total;
+    uint32_t hal_none_cycles_max;
+
     bool dwt_enabled;
 } EthernetRtosRxProfile;
 #endif
@@ -55,6 +72,28 @@ static void *g_rx_frame_handler_context;
 
 #if ETHERNET_RX_PROFILE_ENABLE
 static EthernetRtosRxProfile g_rx_profile;
+static uint32_t g_reported_hal_error_events;
+
+/**
+ * @brief 累计一次 cycle 测量结果。
+ *
+ * @details
+ * 使用 force-inline 避免在 Debug -O0 下为了 profiling 再引入一次函数调用。
+ */
+__STATIC_FORCEINLINE void EthernetRtos_ProfileAccumulate(
+    uint32_t cycles,
+    uint32_t *calls,
+    uint32_t *total,
+    uint32_t *maximum)
+{
+    (*calls)++;
+    (*total) += cycles;
+
+    if (cycles > *maximum)
+    {
+        *maximum = cycles;
+    }
+}
 
 /**
  * @brief 启用 Cortex-M7 DWT cycle counter。
@@ -65,6 +104,8 @@ static EthernetRtosRxProfile g_rx_profile;
  */
 static void EthernetRtos_ProfileInit(void)
 {
+    memset(&g_rx_profile, 0, sizeof(g_rx_profile));
+
     CoreDebug->DEMCR |= CoreDebug_DEMCR_TRCENA_Msk;
     DWT->CYCCNT = 0U;
     DWT->CTRL |= DWT_CTRL_CYCCNTENA_Msk;
@@ -74,54 +115,205 @@ static void EthernetRtos_ProfileInit(void)
 }
 
 /**
- * @brief 在 RX 已空闲后输出一份累计性能快照。
+ * @brief 对本轮 profiling 做原子快照并清零热路径计数。
  *
  * @details
- * 仅当自上次报告后新增了 RX Frame 才打印，因此不会在空闲状态周期刷屏。
- * printf 不在 RX 热路径执行，避免再次制造之前观察到的串口阻塞丢包。
+ * RX event 计数会在 ISR 中更新，因此快照期间短暂关闭中断。这里只复制几十字节
+ * 软件状态，不执行 printf，也不做任何可能阻塞的操作。
+ */
+static bool EthernetRtos_ProfileTakeSnapshot(EthernetRtosRxProfile *snapshot)
+{
+    uint32_t primask;
+    bool dwt_enabled;
+
+    if (snapshot == NULL)
+    {
+        return false;
+    }
+
+    primask = __get_PRIMASK();
+    __disable_irq();
+
+    if ((g_rx_profile.frame_read_calls == 0U) &&
+        (g_rx_profile.none_read_calls == 0U) &&
+        (g_rx_profile.error_read_calls == 0U))
+    {
+        __set_PRIMASK(primask);
+        return false;
+    }
+
+    *snapshot = g_rx_profile;
+    dwt_enabled = g_rx_profile.dwt_enabled;
+
+    memset(&g_rx_profile, 0, sizeof(g_rx_profile));
+    g_rx_profile.dwt_enabled = dwt_enabled;
+
+    __set_PRIMASK(primask);
+
+    return true;
+}
+
+/**
+ * @brief 在 RX 空闲后输出一轮性能快照。
+ *
+ * @details
+ * 第一行按 Receive() 最终结果区分 FRAME / NONE / ERROR；第二行只统计
+ * HAL_ETH_ReadData() 本身。other_frame_avg / other_none_avg 是两层 wall-cycle
+ * 均值之差，可近似表示 Driver 参数检查、返回路径、第二次 memcpy、统计更新以及
+ * profiling wrapper 自身的少量开销，不应解释为某一个单独函数的精确耗时。
  */
 static void EthernetRtos_ProfileReportIfNeeded(void)
 {
-    uint32_t receive_avg = 0U;
+    EthernetRtosRxProfile profile = {0};
+    EthernetDriverStats driver_stats = {0};
+    uint32_t frame_avg = 0U;
+    uint32_t none_avg = 0U;
+    uint32_t error_avg = 0U;
     uint32_t handler_avg = 0U;
+    uint32_t hal_frame_avg = 0U;
+    uint32_t hal_none_avg = 0U;
+    uint32_t other_frame_avg = 0U;
+    uint32_t other_none_avg = 0U;
+    uint32_t hal_error_delta = 0U;
 
-    if (g_rx_profile.rx_receive_frames == g_rx_profile.reported_rx_frames)
+    if (!EthernetRtos_ProfileTakeSnapshot(&profile))
     {
         return;
     }
 
-    if (g_rx_profile.rx_receive_calls != 0U)
+    if (profile.frame_read_calls != 0U)
     {
-        receive_avg = (uint32_t)(
-            g_rx_profile.rx_receive_cycles_total /
-            g_rx_profile.rx_receive_calls);
+        frame_avg = profile.frame_read_cycles_total / profile.frame_read_calls;
     }
 
-    if (g_rx_profile.rx_handler_calls != 0U)
+    if (profile.none_read_calls != 0U)
     {
-        handler_avg = (uint32_t)(
-            g_rx_profile.rx_handler_cycles_total /
-            g_rx_profile.rx_handler_calls);
+        none_avg = profile.none_read_cycles_total / profile.none_read_calls;
+    }
+
+    if (profile.error_read_calls != 0U)
+    {
+        error_avg = profile.error_read_cycles_total / profile.error_read_calls;
+    }
+
+    if (profile.handler_calls != 0U)
+    {
+        handler_avg = profile.handler_cycles_total / profile.handler_calls;
+    }
+
+    if (profile.hal_frame_calls != 0U)
+    {
+        hal_frame_avg = profile.hal_frame_cycles_total / profile.hal_frame_calls;
+    }
+
+    if (profile.hal_none_calls != 0U)
+    {
+        hal_none_avg = profile.hal_none_cycles_total / profile.hal_none_calls;
+    }
+
+    if (frame_avg > hal_frame_avg)
+    {
+        other_frame_avg = frame_avg - hal_frame_avg;
+    }
+
+    if (none_avg > hal_none_avg)
+    {
+        other_none_avg = none_avg - hal_none_avg;
+    }
+
+    if (EthernetDriver_GetStats(&driver_stats))
+    {
+        hal_error_delta =
+            driver_stats.hal_error_events - g_reported_hal_error_events;
+        g_reported_hal_error_events = driver_stats.hal_error_events;
     }
 
     printf(
         "[ETH][PROF] dwt=%u irq=%lu wake=%lu "
-        "read=%lu frame=%lu none=%lu err=%lu "
-        "read_avg=%lu read_max=%lu "
+        "frame=%lu frame_avg=%lu frame_max=%lu "
+        "none=%lu none_avg=%lu none_max=%lu "
+        "err=%lu err_avg=%lu err_max=%lu "
         "handler_avg=%lu handler_max=%lu\r\n",
-        g_rx_profile.dwt_enabled ? 1U : 0U,
-        (unsigned long)g_rx_profile.rx_irq_events,
-        (unsigned long)g_rx_profile.rx_runtime_wakeups,
-        (unsigned long)g_rx_profile.rx_receive_calls,
-        (unsigned long)g_rx_profile.rx_receive_frames,
-        (unsigned long)g_rx_profile.rx_receive_none,
-        (unsigned long)g_rx_profile.rx_receive_errors,
-        (unsigned long)receive_avg,
-        (unsigned long)g_rx_profile.rx_receive_cycles_max,
+        profile.dwt_enabled ? 1U : 0U,
+        (unsigned long)profile.rx_irq_events,
+        (unsigned long)profile.rx_runtime_wakeups,
+        (unsigned long)profile.frame_read_calls,
+        (unsigned long)frame_avg,
+        (unsigned long)profile.frame_read_cycles_max,
+        (unsigned long)profile.none_read_calls,
+        (unsigned long)none_avg,
+        (unsigned long)profile.none_read_cycles_max,
+        (unsigned long)profile.error_read_calls,
+        (unsigned long)error_avg,
+        (unsigned long)profile.error_read_cycles_max,
         (unsigned long)handler_avg,
-        (unsigned long)g_rx_profile.rx_handler_cycles_max);
+        (unsigned long)profile.handler_cycles_max);
 
-    g_rx_profile.reported_rx_frames = g_rx_profile.rx_receive_frames;
+    printf(
+        "[ETH][PROFHAL] hal_frame=%lu hal_frame_avg=%lu hal_frame_max=%lu "
+        "hal_none=%lu hal_none_avg=%lu hal_none_max=%lu "
+        "other_frame_avg=%lu other_none_avg=%lu "
+        "halerr=%lu dma=0x%08lX\r\n",
+        (unsigned long)profile.hal_frame_calls,
+        (unsigned long)hal_frame_avg,
+        (unsigned long)profile.hal_frame_cycles_max,
+        (unsigned long)profile.hal_none_calls,
+        (unsigned long)hal_none_avg,
+        (unsigned long)profile.hal_none_cycles_max,
+        (unsigned long)other_frame_avg,
+        (unsigned long)other_none_avg,
+        (unsigned long)hal_error_delta,
+        (unsigned long)driver_stats.last_dma_error_code);
+}
+
+/*
+ * GNU ld --wrap 入口。
+ * CMake 通过 --wrap=HAL_ETH_ReadData 将 Driver 对 HAL_ETH_ReadData() 的调用
+ * 重定向到这里，再由 __real_HAL_ETH_ReadData() 调用 ST HAL 原实现。
+ * 这样可以测量 HAL 层而不修改 ST HAL 或 Ethernet Driver 热路径源码。
+ */
+HAL_StatusTypeDef __real_HAL_ETH_ReadData(
+    ETH_HandleTypeDef *heth,
+    void **pAppBuff);
+
+HAL_StatusTypeDef __wrap_HAL_ETH_ReadData(
+    ETH_HandleTypeDef *heth,
+    void **pAppBuff)
+{
+    HAL_StatusTypeDef status;
+    uint32_t start = 0U;
+    uint32_t cycles = 0U;
+
+    if (g_rx_profile.dwt_enabled)
+    {
+        start = DWT->CYCCNT;
+    }
+
+    status = __real_HAL_ETH_ReadData(heth, pAppBuff);
+
+    if (g_rx_profile.dwt_enabled)
+    {
+        cycles = DWT->CYCCNT - start;
+    }
+
+    if (status == HAL_OK)
+    {
+        EthernetRtos_ProfileAccumulate(
+            cycles,
+            &g_rx_profile.hal_frame_calls,
+            &g_rx_profile.hal_frame_cycles_total,
+            &g_rx_profile.hal_frame_cycles_max);
+    }
+    else
+    {
+        EthernetRtos_ProfileAccumulate(
+            cycles,
+            &g_rx_profile.hal_none_calls,
+            &g_rx_profile.hal_none_cycles_total,
+            &g_rx_profile.hal_none_cycles_max);
+    }
+
+    return status;
 }
 #endif
 
@@ -172,8 +364,8 @@ static void EthernetRtos_OnTxEvent(void *context)
  *
  * @details
  * 保持已验证的原始 RX 行为：持续调用 EthernetDriver_Receive()，直到当前
- * 无待处理 Frame 或读取失败。Profiling 只测量 Receive() 总耗时和上层
- * handler 耗时，不改变 Buffer ownership、IRQ 配置或 drain 策略。
+ * 无待处理 Frame 或读取失败。Profiling 按返回结果分别统计 Receive() 的
+ * wall-cycle，并单独统计上层 handler，不改变正常收包流程。
  */
 static void EthernetRtos_ProcessRxFrames(void)
 {
@@ -201,27 +393,31 @@ static void EthernetRtos_ProcessRxFrames(void)
         if (g_rx_profile.dwt_enabled)
         {
             receive_cycles = DWT->CYCCNT - receive_start;
-            g_rx_profile.rx_receive_cycles_total += receive_cycles;
-
-            if (receive_cycles > g_rx_profile.rx_receive_cycles_max)
-            {
-                g_rx_profile.rx_receive_cycles_max = receive_cycles;
-            }
         }
-
-        g_rx_profile.rx_receive_calls++;
 
         if (result == ETHERNET_RX_FRAME)
         {
-            g_rx_profile.rx_receive_frames++;
+            EthernetRtos_ProfileAccumulate(
+                receive_cycles,
+                &g_rx_profile.frame_read_calls,
+                &g_rx_profile.frame_read_cycles_total,
+                &g_rx_profile.frame_read_cycles_max);
         }
         else if (result == ETHERNET_RX_NONE)
         {
-            g_rx_profile.rx_receive_none++;
+            EthernetRtos_ProfileAccumulate(
+                receive_cycles,
+                &g_rx_profile.none_read_calls,
+                &g_rx_profile.none_read_cycles_total,
+                &g_rx_profile.none_read_cycles_max);
         }
         else
         {
-            g_rx_profile.rx_receive_errors++;
+            EthernetRtos_ProfileAccumulate(
+                receive_cycles,
+                &g_rx_profile.error_read_calls,
+                &g_rx_profile.error_read_cycles_total,
+                &g_rx_profile.error_read_cycles_max);
         }
 #endif
 
@@ -251,15 +447,13 @@ static void EthernetRtos_ProcessRxFrames(void)
             if (g_rx_profile.dwt_enabled)
             {
                 handler_cycles = DWT->CYCCNT - handler_start;
-                g_rx_profile.rx_handler_cycles_total += handler_cycles;
-
-                if (handler_cycles > g_rx_profile.rx_handler_cycles_max)
-                {
-                    g_rx_profile.rx_handler_cycles_max = handler_cycles;
-                }
             }
 
-            g_rx_profile.rx_handler_calls++;
+            EthernetRtos_ProfileAccumulate(
+                handler_cycles,
+                &g_rx_profile.handler_calls,
+                &g_rx_profile.handler_cycles_total,
+                &g_rx_profile.handler_cycles_max);
 #endif
         }
     }

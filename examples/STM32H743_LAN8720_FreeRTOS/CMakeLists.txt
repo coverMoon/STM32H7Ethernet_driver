@@ -54,6 +54,15 @@ target_include_directories(${CMAKE_PROJECT_NAME} PRIVATE
 target_compile_definitions(${CMAKE_PROJECT_NAME} PRIVATE
 )
 
+#
+# RX 性能诊断专用：
+# 通过 GNU ld --wrap 拦截 HAL_ETH_ReadData()，在不修改 ST HAL 和 Driver
+# 热路径源码的前提下单独测量 HAL RX 处理耗时。完成瓶颈定位后应删除此项。
+#
+target_link_options(${CMAKE_PROJECT_NAME} PRIVATE
+    -Wl,--wrap=HAL_ETH_ReadData
+)
+
 list(REMOVE_ITEM CMAKE_C_IMPLICIT_LINK_LIBRARIES ob)
 
 target_link_libraries(${CMAKE_PROJECT_NAME}
