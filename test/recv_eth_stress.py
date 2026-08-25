@@ -172,7 +172,13 @@ def main() -> None:
         print(f"Frame rate    : {frame_rate_mbps:.2f} Mbit/s")
         print(f"On-wire est.  : {on_wire_mbps:.2f} Mbit/s")
 
-    if missing == 0 and duplicates == 0 and wrong_size == 0:
+    if (
+        missing == 0
+        and duplicates == 0
+        and out_of_order == 0
+        and unexpected_sequence == 0
+        and wrong_size == 0
+    ):
         print("Result        : PASS")
     else:
         print("Result        : INCOMPLETE")
